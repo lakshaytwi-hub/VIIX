@@ -24,6 +24,70 @@ local function __run_combined_file(__source, __name)
 end
 
 -- ============================================================================
+-- LOGIN GATE: feature chunks are queued and only run after a valid key.
+-- ============================================================================
+local __pending_features = {}
+local __features_running = false
+
+local function __defer_feature(__name, __source)
+    __pending_features[#__pending_features + 1] = { name = __name, source = __source }
+end
+
+local function __run_pending_features()
+    if __features_running then return false end
+    local l = _G.LunarLoginRuntime
+    if not (l and l.Authorized) then return false end
+    if #__pending_features == 0 then return false end
+    __features_running = true
+    local queue = __pending_features
+    __pending_features = {}
+    for _, item in ipairs(queue) do
+        __run_combined_file(item.source, item.name)
+        item.source = nil
+    end
+    return true
+end
+_G.__run_pending_features = __run_pending_features
+
+-- ============================================================================
+-- LOGIN STORAGE HELPERS (login.lua expects these before 1.lua runs)
+-- ============================================================================
+function _G.g_masterahsanyt_ESPSettingsPaths()
+    local name = "MASTERPIECE_UMG_ESP_settings.lua"
+    local paths = {
+        "//storage/emulated/0/Android/data/com.tencent.ig/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/Paks/" .. name,
+        "//storage/emulated/0/Android/data/com.vng.pubgmobile/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/Paks/" .. name,
+        "//storage/emulated/0/Android/data/com.pubg.krmobile/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/Paks/" .. name,
+        "//storage/emulated/0/Android/data/com.rekoo.pubgm/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/Paks/" .. name,
+        "//storage/emulated/0/Android/data/com.pubg.imobile/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/Paks/" .. name,
+        "/Documents/ShadowTrackerExtra/Saved/Paks/" .. name,
+        "ShadowTrackerExtra/Saved/Paks/" .. name,
+    }
+    pcall(function()
+        if os and os.getenv then
+            local homeDir = os.getenv("HOME")
+            if homeDir and homeDir ~= "" then
+                table.insert(paths, 1, homeDir .. "/Documents/ShadowTrackerExtra/Saved/Paks/" .. name)
+            end
+        end
+    end)
+    return paths
+end
+
+function _G.g_masterahsanyt_ESPWriteSettings(path, data)
+    if type(path) ~= "string" or type(data) ~= "string" then return false end
+    if not (io and type(io.open) == "function") then return false end
+    local ok, file = pcall(io.open, path, "w")
+    if not ok or not file then return false end
+    local wrote = pcall(function()
+        file:write(data)
+        file:close()
+    end)
+    if not wrote then pcall(function() file:close() end); return false end
+    return true
+end
+
+-- ============================================================================
 -- LOGIN.LUA PROTECTION PATCH (Stops 1.lua / 2.lua / 8.lua from killing Login)
 -- ============================================================================
 do
@@ -52,6 +116,7 @@ end
 -- 0. login.lua (Runs FIRST before 1.lua)
 -- ============================================================================
 __run_combined_file([====[
+--[[
 ================================================================================
   Login.lua - Portable Master Login + Kill Limit 8-10 + LuaCore panel
 ================================================================================
@@ -1034,7 +1099,17 @@ end)()
             end,
             decode=function(raw) local json=require("common.json_util");return json.decode(raw) end,
             post=function(url,headers,body,callback,timeout)
-                local http=ModuleManager.GetModule(ModuleManager.CommonModuleConfig.http_manager)
+                local MM=ModuleManager
+                if not MM then
+                    pcall(function() MM=require("client.module_framework.ModuleManager") end)
+                end
+                if not MM or type(MM.GetModule)~="function" then
+                    error("HTTP_MANAGER_UNAVAILABLE")
+                end
+                local http=MM.GetModule(MM.CommonModuleConfig.http_manager)
+                if not http or type(http.Post)~="function" then
+                    error("HTTP_MANAGER_UNAVAILABLE")
+                end
                 L.Diagnostics.HTTP=L.Diagnostics.HTTP+1
                 return http:Post(url,headers,body,nil,callback,timeout)
             end,
@@ -1043,6 +1118,7 @@ end)()
                 if phase=="active" then
                     L.Authorized=true;L.Key=L.AttemptKey or L.Key;L.Save()
                     destroy(L.LoginUI);L.LoginUI=nil
+                    pcall(function() if _G.__run_pending_features then _G.__run_pending_features() end end)
                 else L.Authorized=false end
                 L.NeedsUpdate=true
                 local d=L.LoginUI
@@ -1089,6 +1165,61 @@ end)()
             end
             L.NeedsUpdate=true -- Half-second retry/readiness while locked only.
         end
+        -- Starts the UI/authorization pump. Safe to call more than once.
+        L.Start=function()
+            if L._Started then return true end
+            L._Started=true
+            L._Beat=os.clock()
+            local function step()
+                L._Beat=os.clock()
+                pcall(function() if L.Update then L.Update() end end)
+                pcall(function() if _G.__run_pending_features then _G.__run_pending_features() end end)
+            end
+            local function getTicker()
+                local t
+                pcall(function() t=require("common.time_ticker") end)
+                return t
+            end
+            local function startLoop()
+                local t=getTicker()
+                if t and type(t.AddTimerLoop)=="function" then
+                    pcall(t.AddTimerLoop,0.5,step,-1,0.5)
+                    return true
+                end
+                if Game and type(Game.SetTimer)=="function" then
+                    pcall(function() Game:SetTimer(0.5,true,step) end)
+                    return true
+                end
+                return false
+            end
+            local function watchdog()
+                if os.clock()-L._Beat>1.5 then startLoop() end
+                local t=getTicker()
+                if t and type(t.AddTimerOnce)=="function" then
+                    pcall(t.AddTimerOnce,1.5,watchdog)
+                elseif Game and type(Game.SetTimer)=="function" then
+                    pcall(function() Game:SetTimer(1.5,false,watchdog) end)
+                end
+            end
+            startLoop()
+            local t=getTicker()
+            if t and type(t.AddTimerOnce)=="function" then
+                pcall(t.AddTimerOnce,1.5,watchdog)
+            elseif Game and type(Game.SetTimer)=="function" then
+                pcall(function() Game:SetTimer(1.5,false,watchdog) end)
+            end
+            -- Independent game-timer watchdog: survives match transitions even
+            -- when the shared ticker is reset by another module.
+            if Game and type(Game.SetTimer)=="function" then
+                pcall(function()
+                    Game:SetTimer(2.0,true,function()
+                        if os.clock()-L._Beat>2.5 then startLoop() end
+                    end)
+                end)
+            end
+            step()
+            return true
+        end
     end
     _G.MasterLicenseLogin=function(key) return _G.LunarLoginRuntime.Login(key) end
     _G.MasterLicenseLogout=function() return _G.LunarLoginRuntime.Logout() end
@@ -1113,7 +1244,7 @@ end)
 -- ============================================================================
 -- 1. 1.lua
 -- ============================================================================
-__run_combined_file([===[
+__defer_feature('1.lua', [===[
 -- ============================================================================
 -- COMBINED BUILD: 1.lua + 5.lua
 -- 1.lua source body is preserved unchanged inside a wrapper.
@@ -16682,12 +16813,12 @@ end
 
 return __combined_1_result
 
-]===], '1.lua')
+]===])
 
 -- ============================================================================
 -- 2. 2.lua
 -- ============================================================================
-__run_combined_file([===[
+__defer_feature('2.lua', [===[
 -- ============================================================================
 -- VIP PRO EDITION V6.1 — EXACT V6 ENGINE + ALL AIMBOT SLIDERS + GREEN/RED CHAMS
 -- Changes from V6:
@@ -18295,12 +18426,12 @@ end
 
 print("[VIP STANDALONE V6.1] Loaded — Full Aimbot Sliders + Green/Red Chams + Multi-Match V6 Engine")
 
-]===], '2.lua')
+]===])
 
 -- ============================================================================
 -- 3. 3.lua
 -- ============================================================================
-__run_combined_file([===[
+__defer_feature('3.lua', [===[
 -- 165 FPS Unlock (FPS only)
 
 local KismetMathLibrary_1 = import("KismetMathLibrary")
@@ -18442,26 +18573,16 @@ if GSC_FPSFT_1 and GSC_FPSFT_1.__inner_impl then
     var_13.OnFPSFTSliderValueChange = var_13.OnFPSFTSliderValueChange3
 end
 
-]===], '3.lua')
+]===])
 
 -- ============================================================================
--- 4. login.lua
+-- 4. login.lua start hook
 -- ============================================================================
-__run_combined_file([===[
---[[
-================================================================================
-  Login.lua - Portable Master Login + Kill Limit 8-10 + LuaCore panel
-================================================================================
-  Dr
-
--- ===== END Login.lua portable module =====
 pcall(function()
-  if _G.LunarLoginRuntime and type(_G.LunarLoginRuntime.Start) == "function" then
-    _G.LunarLoginRuntime.Start()
-  end
+    local l = _G.LunarLoginRuntime
+    if l and type(l.Start) == "function" then l.Start() end
+    if _G.__run_pending_features then _G.__run_pending_features() end
 end)
-
-]===], 'login.lua')
 
 if #__combined_errors > 0 and print then
     for _, __e in ipairs(__combined_errors) do
