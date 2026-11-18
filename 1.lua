@@ -24,6 +24,70 @@ local function __run_combined_file(__source, __name)
 end
 
 -- ============================================================================
+-- LOGIN GATE: feature chunks are queued and only run after a valid key.
+-- ============================================================================
+local __pending_features = {}
+local __features_running = false
+
+local function __defer_feature(__name, __source)
+    __pending_features[#__pending_features + 1] = { name = __name, source = __source }
+end
+
+local function __run_pending_features()
+    if __features_running then return false end
+    local l = _G.LunarLoginRuntime
+    if not (l and l.Authorized) then return false end
+    if #__pending_features == 0 then return false end
+    __features_running = true
+    local queue = __pending_features
+    __pending_features = {}
+    for _, item in ipairs(queue) do
+        __run_combined_file(item.source, item.name)
+        item.source = nil
+    end
+    return true
+end
+_G.__run_pending_features = __run_pending_features
+
+-- ============================================================================
+-- LOGIN STORAGE HELPERS (login.lua expects these before 1.lua runs)
+-- ============================================================================
+function _G.g_VRSXH_ESPSettingsPaths()
+    local name = "MASTERPIECE_UMG_ESP_settings.lua"
+    local paths = {
+        "//storage/emulated/0/Android/data/com.tencent.ig/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/Paks/" .. name,
+        "//storage/emulated/0/Android/data/com.vng.pubgmobile/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/Paks/" .. name,
+        "//storage/emulated/0/Android/data/com.pubg.krmobile/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/Paks/" .. name,
+        "//storage/emulated/0/Android/data/com.rekoo.pubgm/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/Paks/" .. name,
+        "//storage/emulated/0/Android/data/com.pubg.imobile/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/Paks/" .. name,
+        "/Documents/ShadowTrackerExtra/Saved/Paks/" .. name,
+        "ShadowTrackerExtra/Saved/Paks/" .. name,
+    }
+    pcall(function()
+        if os and os.getenv then
+            local homeDir = os.getenv("HOME")
+            if homeDir and homeDir ~= "" then
+                table.insert(paths, 1, homeDir .. "/Documents/ShadowTrackerExtra/Saved/Paks/" .. name)
+            end
+        end
+    end)
+    return paths
+end
+
+function _G.g_VRSXH_ESPWriteSettings(path, data)
+    if type(path) ~= "string" or type(data) ~= "string" then return false end
+    if not (io and type(io.open) == "function") then return false end
+    local ok, file = pcall(io.open, path, "w")
+    if not ok or not file then return false end
+    local wrote = pcall(function()
+        file:write(data)
+        file:close()
+    end)
+    if not wrote then pcall(function() file:close() end); return false end
+    return true
+end
+
+-- ============================================================================
 -- LOGIN.LUA PROTECTION PATCH (Stops 1.lua / 2.lua / 8.lua from killing Login)
 -- ============================================================================
 do
@@ -52,6 +116,7 @@ end
 -- 0. login.lua (Runs FIRST before 1.lua)
 -- ============================================================================
 __run_combined_file([====[
+--[[
 ================================================================================
   Login.lua - Portable Master Login + Kill Limit 8-10 + LuaCore panel
 ================================================================================
@@ -553,7 +618,11 @@ end)()
         local passive=enums.SelfHitTestInvisible
         if enums.Visible==nil or passive==nil then return nil,"UI_ENUM_UNAVAILABLE" end
         local welcome=kind=="welcome"
-        local W,H=welcome and 600 or 500,welcome and 276 or 248
+        local keyinfo=kind=="keyinfo"
+        local W,H
+        if keyinfo then W,H=560,190
+        elseif welcome then W,H=600,276
+        else W,H=500,248 end
         local scale=welcome and 0.8 or 1
         pcall(function()
             local v=p:GetCachedGeometry():GetLocalSize()
@@ -738,6 +807,19 @@ end)()
                 panel(px+3,102,pw-6,45,10,{{20,60,140},{40,110,210},{25,80,170}},5,20)
                 d.Detail=text("Kill limit 8-10",px+16,109,pw-32,34,23,white,7,true,true)
                 d.Hint=text("Play smart and avoid report",30,165,W-60,32,17,forest,7,true,true)
+            elseif keyinfo then
+                d.Title=text("VRSXH",22,12,W-44,30,22,white,7,true,true)
+                text("YOUR KEY",22,42,W-44,20,13,burgundy,7,true,false)
+                rail(27,64,W-54,2,gold,4,24)
+                rail(27,112,W-54,2,gold,4,24)
+                rect(20,71,2,35,color(40,120,220),4)
+                rect(W-22,71,2,35,color(50,140,240),4)
+                line(20,71,27,64,2,color(90,170,255),4)
+                line(W-27,64,W-20,71,2,color(90,170,255),4)
+                line(20,107,27,114,2,color(90,170,255),4)
+                line(W-27,114,W-20,107,2,color(90,170,255),4)
+                d.KeyText=text(key or "",23,68,W-46,38,20,white,8,true,true)
+                d.Hint=text("Auto close in 5s",22,122,W-44,20,11,burgundy,7,true,false)
             else
                 d.Title=text("VRSXH",22,15,W-44,31,24,white,7,true,true)
                 text("LOGIN",22,45,W-44,21,12,white,7,true,true)
@@ -791,8 +873,9 @@ end)()
                 d.Status=text(status or "Enter your key",22,170,W-44,23,11,burgundy,8,false,false,true)
             end
             local button=make("Button",d.Container);d.Button=button
-            local by=welcome and 212 or 201;local bh=welcome and 42 or 34
-            local bw=welcome and 202 or 190;local bx=(W-bw)/2
+            local by=(keyinfo and 148) or (welcome and 212 or 201)
+            local bh=welcome and 42 or (keyinfo and 28 or 34)
+            local bw=welcome and 202 or (keyinfo and 150 or 190);local bx=(W-bw)/2
             panel(bx-4,by-3,bw+8,bh+6,9,gold,4,16)
             panel(bx,by,bw,bh,8,{{0,112,51},{1,149,68},{0,99,46}},5,16)
             pcall(function() button:SetBackgroundColor(color(255,255,255,0)) end)
@@ -804,9 +887,13 @@ end)()
             d.Event=button.OnClicked
             d.Handle=d.Event:Add(function()
                 if not d.Visible or d.Busy then return end
-                if welcome then
+                if welcome or keyinfo then
                     destroy(d);d.Dismissed=true
-                    local l=_G.LunarLoginRuntime;if l and l.WelcomeUI==d then l.WelcomeUI=nil end
+                    local l=_G.LunarLoginRuntime
+                    if l then
+                        if l.WelcomeUI==d then l.WelcomeUI=nil end
+                        if l.KeyUI==d then l.KeyUI=nil end
+                    end
                     return
                 end
                 local okRead,k=pcall(function() return d.Input:GetText() end)
@@ -1020,7 +1107,10 @@ end)()
             assert(saved or L.IdentityPersisted,"DEVICE_CACHE_SAVE_FAILED")
         end
         recover()
-        L.DestroyUI=function() destroy(L.LoginUI);destroy(L.WelcomeUI);L.LoginUI=nil;L.WelcomeUI=nil end
+        L.DestroyUI=function()
+            destroy(L.LoginUI);destroy(L.WelcomeUI);destroy(L.KeyUI)
+            L.LoginUI=nil;L.WelcomeUI=nil;L.KeyUI=nil
+        end
         local function wake()
             local f=_G.LunarFeatures;if f and f.Wake and not f.Token.Stopped then f.Wake() end
         end
@@ -1034,7 +1124,17 @@ end)()
             end,
             decode=function(raw) local json=require("common.json_util");return json.decode(raw) end,
             post=function(url,headers,body,callback,timeout)
-                local http=ModuleManager.GetModule(ModuleManager.CommonModuleConfig.http_manager)
+                local MM=ModuleManager
+                if not MM then
+                    pcall(function() MM=require("client.module_framework.ModuleManager") end)
+                end
+                if not MM or type(MM.GetModule)~="function" then
+                    error("HTTP_MANAGER_UNAVAILABLE")
+                end
+                local http=MM.GetModule(MM.CommonModuleConfig.http_manager)
+                if not http or type(http.Post)~="function" then
+                    error("HTTP_MANAGER_UNAVAILABLE")
+                end
                 L.Diagnostics.HTTP=L.Diagnostics.HTTP+1
                 return http:Post(url,headers,body,nil,callback,timeout)
             end,
@@ -1042,7 +1142,11 @@ end)()
                 L.Status=message;L.Pending=phase=="pending"
                 if phase=="active" then
                     L.Authorized=true;L.Key=L.AttemptKey or L.Key;L.Save()
+                    -- The player just typed the key, so skip the reminder popup
+                    -- for this login. It still appears once after a restart.
+                    L.KeyShown=true;L.KeyPopupDone=true
                     destroy(L.LoginUI);L.LoginUI=nil
+                    pcall(function() if _G.__run_pending_features then _G.__run_pending_features() end end)
                 else L.Authorized=false end
                 L.NeedsUpdate=true
                 local d=L.LoginUI
@@ -1071,6 +1175,27 @@ end)()
             if L.Pending then L.Auth.Tick() end
             if L.Dirty and (not L.SaveRetryAt or os.time()>=L.SaveRetryAt or os.time()<L.SaveRetryAt-30) then L.Save() end
             if L.Authorized then
+                -- Key reminder: after a full game restart the saved session is
+                -- restored silently, so show the stored key once for ~5s.
+                if L.KeyUI and not valid(L.KeyUI.Container) then L.KeyUI=nil end
+                if not L.KeyPopupDone and (L.Key or "")~="" then
+                    if not L.KeyShownAt then L.KeyShownAt=os.clock() end
+                    if L.KeyUI then
+                        if os.clock()-L.KeyShownAt>=5 then
+                            destroy(L.KeyUI);L.KeyUI=nil;L.KeyPopupDone=true
+                        else
+                            L.NeedsUpdate=true;return
+                        end
+                    elseif os.clock()-L.KeyShownAt<5 then
+                        local d=UI.Build("keyinfo",L.Key)
+                        if d then
+                            L.KeyUI=d;L.KeyShown=true;L.NeedsUpdate=true
+                            return
+                        end
+                    else
+                        L.KeyPopupDone=true
+                    end
+                end
                 if not L.WelcomeShown then
                     local d=UI.Build("welcome")
                     if d then L.WelcomeUI=d;L.WelcomeShown=true end
@@ -1088,6 +1213,61 @@ end)()
                 end
             end
             L.NeedsUpdate=true -- Half-second retry/readiness while locked only.
+        end
+        -- Starts the UI/authorization pump. Safe to call more than once.
+        L.Start=function()
+            if L._Started then return true end
+            L._Started=true
+            L._Beat=os.clock()
+            local function step()
+                L._Beat=os.clock()
+                pcall(function() if L.Update then L.Update() end end)
+                pcall(function() if _G.__run_pending_features then _G.__run_pending_features() end end)
+            end
+            local function getTicker()
+                local t
+                pcall(function() t=require("common.time_ticker") end)
+                return t
+            end
+            local function startLoop()
+                local t=getTicker()
+                if t and type(t.AddTimerLoop)=="function" then
+                    pcall(t.AddTimerLoop,0.5,step,-1,0.5)
+                    return true
+                end
+                if Game and type(Game.SetTimer)=="function" then
+                    pcall(function() Game:SetTimer(0.5,true,step) end)
+                    return true
+                end
+                return false
+            end
+            local function watchdog()
+                if os.clock()-L._Beat>1.5 then startLoop() end
+                local t=getTicker()
+                if t and type(t.AddTimerOnce)=="function" then
+                    pcall(t.AddTimerOnce,1.5,watchdog)
+                elseif Game and type(Game.SetTimer)=="function" then
+                    pcall(function() Game:SetTimer(1.5,false,watchdog) end)
+                end
+            end
+            startLoop()
+            local t=getTicker()
+            if t and type(t.AddTimerOnce)=="function" then
+                pcall(t.AddTimerOnce,1.5,watchdog)
+            elseif Game and type(Game.SetTimer)=="function" then
+                pcall(function() Game:SetTimer(1.5,false,watchdog) end)
+            end
+            -- Independent game-timer watchdog: survives match transitions even
+            -- when the shared ticker is reset by another module.
+            if Game and type(Game.SetTimer)=="function" then
+                pcall(function()
+                    Game:SetTimer(2.0,true,function()
+                        if os.clock()-L._Beat>2.5 then startLoop() end
+                    end)
+                end)
+            end
+            step()
+            return true
         end
     end
     _G.MasterLicenseLogin=function(key) return _G.LunarLoginRuntime.Login(key) end
@@ -1113,7 +1293,7 @@ end)
 -- ============================================================================
 -- 1. 1.lua
 -- ============================================================================
-__run_combined_file([===[
+__defer_feature('1.lua', [===[
 -- ============================================================================
 -- COMBINED BUILD: 1.lua + 5.lua
 -- 1.lua source body is preserved unchanged inside a wrapper.
@@ -16682,12 +16862,12 @@ end
 
 return __combined_1_result
 
-]===], '1.lua')
+]===])
 
 -- ============================================================================
 -- 2. 2.lua
 -- ============================================================================
-__run_combined_file([===[
+__defer_feature('2.lua', [===[
 -- ============================================================================
 -- VIP PRO EDITION V6.1 — EXACT V6 ENGINE + ALL AIMBOT SLIDERS + GREEN/RED CHAMS
 -- Changes from V6:
@@ -18295,12 +18475,12 @@ end
 
 print("[VIP STANDALONE V6.1] Loaded — Full Aimbot Sliders + Green/Red Chams + Multi-Match V6 Engine")
 
-]===], '2.lua')
+]===])
 
 -- ============================================================================
 -- 3. 3.lua
 -- ============================================================================
-__run_combined_file([===[
+__defer_feature('3.lua', [===[
 -- 165 FPS Unlock (FPS only)
 
 local KismetMathLibrary_1 = import("KismetMathLibrary")
@@ -18442,26 +18622,16 @@ if GSC_FPSFT_1 and GSC_FPSFT_1.__inner_impl then
     var_13.OnFPSFTSliderValueChange = var_13.OnFPSFTSliderValueChange3
 end
 
-]===], '3.lua')
+]===])
 
 -- ============================================================================
--- 4. login.lua
+-- 4. login.lua start hook
 -- ============================================================================
-__run_combined_file([===[
---[[
-================================================================================
-  Login.lua - Portable Master Login + Kill Limit 8-10 + LuaCore panel
-================================================================================
-  Dr
-
--- ===== END Login.lua portable module =====
 pcall(function()
-  if _G.LunarLoginRuntime and type(_G.LunarLoginRuntime.Start) == "function" then
-    _G.LunarLoginRuntime.Start()
-  end
+    local l = _G.LunarLoginRuntime
+    if l and type(l.Start) == "function" then l.Start() end
+    if _G.__run_pending_features then _G.__run_pending_features() end
 end)
-
-]===], 'login.lua')
 
 if #__combined_errors > 0 and print then
     for _, __e in ipairs(__combined_errors) do
