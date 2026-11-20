@@ -10953,6 +10953,7 @@ do
     end
 end
 
+
 --- ============================================================================
 -- VRSXH UNIFIED ZERO-LAG STANDALONE SUITE (OPTIMIZED FOR 0.00ms MATCH IMPACT)
 -- Modules Included:
@@ -11050,15 +11051,39 @@ end
 _G.download_item = downloadSkinAsset
 
 local _OrigCDataTableGet = CDataTable and CDataTable.GetTableData
-local _cfgCache = {}
+
+-- Lazy resolver: on a cold boot CDataTable may not exist yet when this file is
+-- loaded.  Capturing it once at load time would leave _OrigCDataTableGet nil
+-- forever, and every config lookup -- including the whole attachment mapper --
+-- would silently return nothing.
+local function _refreshOrigCfgGet()
+    if type(_OrigCDataTableGet) == "function" then return _OrigCDataTableGet end
+    if CDataTable and type(CDataTable.GetTableData) == "function" then
+        _OrigCDataTableGet = CDataTable.GetTableData
+    end
+    return _OrigCDataTableGet
+end
+
+local _cfgCache  = {}
+local _cfgProven = false   -- true once at least one real row has been read
+
 local function GetItemCfgFast(resID)
     resID = tonumber(resID)
     if not resID or resID <= 0 then return nil end
     local cached = _cfgCache[resID]
     if cached ~= nil then return cached or nil end
-    local c = _OrigCDataTableGet and _OrigCDataTableGet("Item", resID)
-    _cfgCache[resID] = c or false
-    return c
+    local get = _refreshOrigCfgGet()
+    local c = get and get("Item", resID)
+    if c then
+        _cfgProven = true
+        _cfgCache[resID] = c
+    elseif _cfgProven then
+        -- Config is definitely loaded now, so a miss is a genuine miss.
+        _cfgCache[resID] = false
+    end
+    -- While the config is still cold we deliberately do NOT cache the miss,
+    -- so the lookup is retried once the tables are ready.
+    return c or nil
 end
 
 local ROOT_DIR   = "/storage/emulated/0/Android/data/com.pubg.imobile/files/"
@@ -11254,6 +11279,14 @@ do
 
         local function getEquippedEmotesForWheel()
             local slotList = (DataMgr and DataMgr.MotionSlotList) or {}
+
+            -- Sync slot list -> res cache BEFORE building the signature, otherwise the
+            -- cached list is one change behind and the wheel shows stale emotes.
+            for k, v in pairs(slotList) do
+                local r = resolveResFromIns(v)
+                if r and r > 0 then INV.emotes[tonumber(k)] = r end
+            end
+
             local parts = {}
             for k, v in pairs(slotList) do
                 parts[#parts + 1] = tostring(k) .. ":" .. tostring(v)
@@ -11263,11 +11296,6 @@ do
             end
             local key = table.concat(parts, ",")
             if key == _emoteCacheKey then return _emoteListCache end
-
-            for k, v in pairs(slotList) do
-                local r = resolveResFromIns(v)
-                if r and r > 0 then INV.emotes[tonumber(k)] = r end
-            end
 
             _emoteCacheKey = key
             _emoteListCache = {}
@@ -11469,6 +11497,7 @@ do
                 if QEU and not QEU._MasterEmoteWheelFixed then
                     QEU._MasterEmoteWheelFixed = true
                     local origGetList = QEU.GetShowExpressionList
+                    if type(origGetList) ~= "function" then return end
                     QEU.GetShowExpressionList = function()
                         local tShowEmoteList, nWeaponEmoteId = origGetList()
                         tShowEmoteList = tShowEmoteList or {}
@@ -11499,6 +11528,7 @@ do
                 if QE and not QE._MasterEmoteImgFixed then
                     QE._MasterEmoteImgFixed = true
                     local origGetImg = QE.GetEmoteImagePalthMap
+                    if type(origGetImg) ~= "function" then return end
                     QE.GetEmoteImagePalthMap = function(self, ...)
                         origGetImg(self, ...)
                         for _, em in ipairs(getEquippedEmotesForWheel()) do
@@ -11515,10 +11545,12 @@ do
                 if le and not le._MasterEmoteExistFixed then
                     le._MasterEmoteExistFixed = true
                     local origExist = le.IsEmoteExist
-                    le.IsEmoteExist = function(EmoteID)
-                        local c = GetItemCfgFast(EmoteID)
-                        if c and tonumber(c.ItemType or c.itemType) == 22 then return true end
-                        return origExist(EmoteID)
+                    if type(origExist) == "function" then
+                        le.IsEmoteExist = function(EmoteID)
+                            local c = GetItemCfgFast(EmoteID)
+                            if c and tonumber(c.ItemType or c.itemType) == 22 then return true end
+                            return origExist(EmoteID)
+                        end
                     end
                     if le.CheckEmoteDownloaded then
                         local origDl = le.CheckEmoteDownloaded
@@ -11891,10 +11923,12 @@ do
                 if WDE and not WDE._VrsxhV1InitHooked then
                     WDE._VrsxhV1InitHooked = true
                     local origInit = WDE.InitData
-                    WDE.InitData = function(self, pkg, ...)
-                        local ret = origInit(self, pkg, ...)
-                        pcall(function() InjectBagsAndHelmetsIntoEntity(self) end)
-                        return ret
+                    if type(origInit) == "function" then
+                        WDE.InitData = function(self, pkg, ...)
+                            local ret = origInit(self, pkg, ...)
+                            pcall(function() InjectBagsAndHelmetsIntoEntity(self) end)
+                            return ret
+                        end
                     end
                 end
             end)
@@ -11994,30 +12028,38 @@ do
                         end
                     end
                     local origCanUse = wl.IsCanUse
-                    wl.IsCanUse = function(self, resId, ...)
-                        if BagHelResToIns[tonumber(resId)] then return true end
-                        return origCanUse(self, resId, ...)
+                    if type(origCanUse) == "function" then
+                        wl.IsCanUse = function(self, resId, ...)
+                            if BagHelResToIns[tonumber(resId)] then return true end
+                            return origCanUse(self, resId, ...)
+                        end
                     end
                     local origCharUse = wl.IsCharacterUse
-                    wl.IsCharacterUse = function(self, resId, ...)
-                        if BagHelResToIns[tonumber(resId)] then return true end
-                        return origCharUse(self, resId, ...)
+                    if type(origCharUse) == "function" then
+                        wl.IsCharacterUse = function(self, resId, ...)
+                            if BagHelResToIns[tonumber(resId)] then return true end
+                            return origCharUse(self, resId, ...)
+                        end
                     end
                     local origGetIns = wl.GetWardrobeInsIdByResId
-                    wl.GetWardrobeInsIdByResId = function(self, resid, ...)
-                        local n = tonumber(resid)
-                        if n and BagHelResToIns[n] then return BagHelResToIns[n] end
-                        return origGetIns(self, resid, ...)
+                    if type(origGetIns) == "function" then
+                        wl.GetWardrobeInsIdByResId = function(self, resid, ...)
+                            local n = tonumber(resid)
+                            if n and BagHelResToIns[n] then return BagHelResToIns[n] end
+                            return origGetIns(self, resid, ...)
+                        end
                     end
                     local origFilter = wl.IsValidCurrentPageItem
-                    wl.IsValidCurrentPageItem = function(self, mainTab, subTab, v, t)
-                        if mainTab == 1 and v and v.resID and BagHelResToIns[tonumber(v.resID)] then
-                            local st = tonumber(v.itemSubType)
-                            if subTab == 15 and st == 504 then return true end
-                            if subTab == 16 and st == 505 then return true end
-                            return false
+                    if type(origFilter) == "function" then
+                        wl.IsValidCurrentPageItem = function(self, mainTab, subTab, v, t)
+                            if mainTab == 1 and v and v.resID and BagHelResToIns[tonumber(v.resID)] then
+                                local st = tonumber(v.itemSubType)
+                                if subTab == 15 and st == 504 then return true end
+                                if subTab == 16 and st == 505 then return true end
+                                return false
+                            end
+                            return origFilter(self, mainTab, subTab, v, t)
                         end
-                        return origFilter(self, mainTab, subTab, v, t)
                     end
                 end
             end)
@@ -12027,23 +12069,27 @@ do
                 if WRH and not WRH._VrsxhV1PutHooked then
                     WRH._VrsxhV1PutHooked = true
                     local origPutOnReq = WRH.send_depot_put_on_req
-                    WRH.send_depot_put_on_req = function(insID, extra)
-                        local nIns = tonumber(insID)
-                        local resID = nIns and BagHelInsToRes[nIns]
-                        if resID and EquipBagOrHelmetOnTap(resID, nIns) then return end
-                        return origPutOnReq(insID, extra)
+                    if type(origPutOnReq) == "function" then
+                        WRH.send_depot_put_on_req = function(insID, extra)
+                            local nIns = tonumber(insID)
+                            local resID = nIns and BagHelInsToRes[nIns]
+                            if resID and EquipBagOrHelmetOnTap(resID, nIns) then return end
+                            return origPutOnReq(insID, extra)
+                        end
                     end
                     local origPutOnRsp = WRH.on_depot_put_on_rsp
-                    WRH.on_depot_put_on_rsp = function(res, item, olditem, slot, newInsID, oldInsID, extra)
-                        local ret = origPutOnRsp(res, item, olditem, slot, newInsID, oldInsID, extra)
-                        if not _HandlingBagHelTap and type(item) == "table" and item.res_id then
-                            local rId = tonumber(item.res_id)
-                            local iId = tonumber(item.instid or newInsID)
-                            if rId and (IsBagID(rId) or IsHelmetID(rId)) then
-                                EquipBagOrHelmetOnTap(rId, iId)
+                    if type(origPutOnRsp) == "function" then
+                        WRH.on_depot_put_on_rsp = function(res, item, olditem, slot, newInsID, oldInsID, extra)
+                            local ret = origPutOnRsp(res, item, olditem, slot, newInsID, oldInsID, extra)
+                            if not _HandlingBagHelTap and type(item) == "table" and item.res_id then
+                                local rId = tonumber(item.res_id)
+                                local iId = tonumber(item.instid or newInsID)
+                                if rId and (IsBagID(rId) or IsHelmetID(rId)) then
+                                    EquipBagOrHelmetOnTap(rId, iId)
+                                end
                             end
+                            return ret
                         end
-                        return ret
                     end
                 end
             end)
@@ -12177,7 +12223,8 @@ do
         local function generateAndSaveAttachFileLobbyOnly()
             -- NEVER run table generation during a live match!
             if IsInMatch() then return false end
-            if not (CDataTable and CDataTable.GetTable and _OrigCDataTableGet) then return false end
+            if not _refreshOrigCfgGet() then return false end
+            if not (CDataTable and CDataTable.GetTable) then return false end
             local unlockTbl = CDataTable.GetTable("ItemUpgradeUnLockConfig")
             local upTbl     = CDataTable.GetTable("ItemUpgradeConfig")
             if not (unlockTbl and upTbl) then return false end
@@ -12277,9 +12324,16 @@ do
             return false
         end
 
+        local _lastAttachTry = -1e9   -- never throttle the very first attempt
+        local _attachFails   = 0
         local function loadAttachCache()
             if ACLoaded then return end
-            ACLoaded = true -- Mark tried so we never retry inside a match!
+            -- Do NOT mark as loaded before we actually have data.  Previously a single
+            -- failed generation (config not ready at boot) permanently disabled the
+            -- whole attachment mapper for the session.
+            local now = os.clock()
+            if now - _lastAttachTry < 5.0 then return end
+            _lastAttachTry = now
             AC = {}; ACValidSet = {}; AttachToBase = {}
             local count = 0
             local f = io.open(ATTACH_TXT, "r")
@@ -12298,8 +12352,21 @@ do
                 end
                 f:close()
             end
-            if count == 0 and IsInLobby() then
-                pcall(generateAndSaveAttachFileLobbyOnly)
+            if count > 0 then
+                ACLoaded = true
+            elseif IsInLobby() then
+                if _attachFails < 30 then
+                    local ok, generated = pcall(generateAndSaveAttachFileLobbyOnly)
+                    if ok and generated then
+                        ACLoaded = true
+                        _attachFails = 0
+                    else
+                        _attachFails = _attachFails + 1
+                        -- Config may have been cold during generation: drop the
+                        -- lookup cache so the next attempt re-reads real rows.
+                        if not _cfgProven then _cfgCache = {} end
+                    end
+                end
             end
         end
 
@@ -12442,12 +12509,13 @@ do
                 lines[#lines + 1] = "WEAPON_" .. wid .. "=" .. res
             end
 
-            if #lines > 0 then
-                local wf = io.open(MATCH_TXT, "w")
-                if wf then
-                    wf:write(table.concat(lines, "\n") .. "\n")
-                    wf:close()
-                end
+            -- Always rewrite, even when empty: otherwise unequipping everything leaves
+            -- the previous match's skins in the file and they get re-applied.
+            local wf = io.open(MATCH_TXT, "w")
+            if wf then
+                wf:write(table.concat(lines, "\n"))
+                if #lines > 0 then wf:write("\n") end
+                wf:close()
             end
         end
 
@@ -12477,7 +12545,12 @@ do
         local _appliedCharInit = setmetatable({}, { __mode = "k" })
 
         local function applyAllCharacterSlotsUnified(char)
-            local ac = char.AvatarComponent2 or char.CharacterAvatarComp2_BP or (char.getAvatarComponent2 and char:getAvatarComponent2())
+            local ac = char.AvatarComponent2
+                    or char.CharacterAvatarComp2_BP
+                    or char.CharacterAvatarComponent_BP
+                    or char.CharacterAvatarComponent
+                    or char.AvatarComponent
+                    or (char.getAvatarComponent2 and char:getAvatarComponent2())
             if not SafeValid(ac) or not ac.NetAvatarData then return end
             local sd = ac.NetAvatarData.SlotSyncData
             if not SafeValid(sd) then return end
@@ -12551,7 +12624,9 @@ do
                         local lvl = (bu and bu.GetEquipmentHelmetLevel and bu.GetEquipmentHelmetLevel(eq.AdditionalItemID)) or 3
                         if lvl < 1 or lvl > 3 then lvl = 3 end
                         target = ConvertBagHelmetLevel(V1State.helmetLv3, lvl)
-                    elseif slotID == 11 and curID > 0 and paraRes > 0 then
+                    elseif slotID == 11 and paraRes > 0 then
+                        -- Slot 11 is often still 0 until the parachute actually spawns,
+                        -- so requiring curID > 0 meant the skin was never applied.
                         target = paraRes
                     elseif slotID == 15 and gliderRes > 0 then
                         target = gliderRes
@@ -13643,7 +13718,7 @@ do
                 end
             end
             if type(_G.AddOutfitEquippedCache) == "table" then
-                local cOut = tonumber(_G.AddOutfitEquippedCache.outfitRes) or 0
+                local cOut = tonumber(_G.AddOutfitEquippedCache.outfitRes) or tonumber(_G.AddOutfitEquippedCache.outfit) or 0
                 if cOut > 0 then SkinState.outfitID = cOut end
                 if type(_G.AddOutfitEquippedCache.weapons) == "table" then
                     for wid, w in pairs(_G.AddOutfitEquippedCache.weapons) do
@@ -14543,6 +14618,8 @@ do
         end
     end
 end
+
+
 
 -- ============================================================================
 -- DIRECT PATCH: T-SHIRT (403), PANTS (404), SHOES (405) LOBBY SAVE + MATCH EQUIP
