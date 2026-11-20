@@ -1,32 +1,4 @@
 -- ============================================================================
--- SHARED TRANSITION GUARDS (between-match crash fixes)
--- FIX: one allocation-free validity test + one non-throwing timer helper,
---      used by every match-boundary guard below. pcall-wrapped because
---      slua.isValid throws on a freed userdata.
--- ============================================================================
-if not _G.SafeValid then
-    function _G.SafeValid(o)
-        if o == nil then return false end
-        local ok, r = pcall(slua.isValid, o)
-        return ok and r == true
-    end
-end
-if not _G.SafeSetTimer then
-    function _G.SafeSetTimer(sec, looping, fn)
-        if not Game or type(Game.SetTimer) ~= "function" then return nil end
-        local ok, h = pcall(function() return Game:SetTimer(sec, looping, fn) end)
-        return ok and h or nil
-    end
-end
-if not _G.SafeClearTimer then
-    function _G.SafeClearTimer(h)
-        if h == nil then return end
-        if not Game or type(Game.ClearTimer) ~= "function" then return end
-        pcall(function() Game:ClearTimer(h) end)
-    end
-end
-
--- ============================================================================
 -- COMBINED BUILD: login.lua + 1.lua + 2.lua + 3.lua
 -- ============================================================================
 
@@ -7924,36 +7896,16 @@ pcall(function()
     -- 3. Safety timer: re‑apply vehicle skins every second (backup for 4.lua's loop)
     local function vehicleSkinLoop()
         pcall(function()
-            if not GameStatus or not GameStatus.IsInFightingStatus then return end
-            -- FIX: require the transition to be settled, not merely "in fight".
-            --      IsInFightingStatus() stays true past the result screen while
-            --      the pawn and its vehicle components are being destroyed.
-            local okFight, inFight = pcall(GameStatus.IsInFightingStatus)
-            if not okFight or not inFight then return end
-            if GameStatus.IsInLobbyOrMainCity then
-                local okLob, inLob = pcall(GameStatus.IsInLobbyOrMainCity)
-                if okLob and inLob then return end
-            end
-
-            -- FIX: cached module lookup instead of require() every second.
-            local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
-                    or require("GameLua.GameCore.Data.GameplayData")
+            if not GameStatus or not GameStatus.IsInFightingStatus() then return end
+            local GD = require("GameLua.GameCore.Data.GameplayData")
             local playerChar = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
-            if not slua.isValid(playerChar) then return end
-
-            -- FIX: the pawn must still own a live vehicle before we touch skins.
-            local veh = nil
-            pcall(function() veh = playerChar.CurrentVehicle end)
-            if not slua.isValid(veh) then return end
-
-            if _G.ApplyVehicleSkins then
+            if slua.isValid(playerChar) and _G.ApplyVehicleSkins then
                 _G.ApplyVehicleSkins(playerChar)
             end
         end)
     end
-    -- FIX: guarded creation; Game is nil for a window during the handoff.
     if not _G._vehicleTimer then
-        _G._vehicleTimer = SafeSetTimer(1.0, true, vehicleSkinLoop)
+        _G._vehicleTimer = Game:SetTimer(1.0, true, vehicleSkinLoop)
     end
 
     -- 4. Add premium vehicle switch effect (transform animation)
@@ -8021,9 +7973,8 @@ end)
 -- ============================================================
 -- LOAD SAVED LOBBY STATE ON LOGIN
 -- ============================================================
--- FIX: guarded; Game:SetTimer threw when the handoff caught Game mid-teardown.
-SafeSetTimer(2.5, false, function()
-    pcall(function() _G.LoadLobbyState() end)
+Game:SetTimer(2.5, false, function()
+    _G.LoadLobbyState()
 end)
 
 print("[LOBBY SAVE] ✅ Lobby state save/load system loaded!")
@@ -9880,13 +9831,8 @@ local function AddItems()
     end)
 end
 
--- FIX: the handle was cleared and then immediately re-created, so the clear
---      was a no-op and a fresh AddItems chain was added on every re-execution.
-if _G._SkinMgrTimer then
-    SafeClearTimer(_G._SkinMgrTimer)
-    _G._SkinMgrTimer = nil
-end
-_G._SkinMgrTimer = SafeSetTimer(2, true, AddItems)
+if _G._SkinMgrTimer then pcall(function() Game:ClearTimer(_G._SkinMgrTimer) end) end
+_G._SkinMgrTimer = Game:SetTimer(2,true,AddItems)
 
 pcall(function()
     local ok,U=pcall(require,"GameLua.Util.UIUtils")
@@ -9896,32 +9842,18 @@ end)
 -- Chat hook for !s
 local _chatBound=false
 local _bindAttempts=0
-local _boundCC=nil            -- FIX: remember which component we hooked
 local function BindChat()
-    -- FIX: if the component we hooked is dead, allow a re-bind for the new match.
-    if _chatBound and not isValid(_boundCC) then
-        _chatBound=false
-        _boundCC=nil
-    end
     if _chatBound then return end
     _bindAttempts=_bindAttempts+1
     if _bindAttempts>10 then return end
     local pc=slua_GameFrontendHUD and slua_GameFrontendHUD:GetPlayerController()
-    -- FIX: guarded retry; never throw when Game is mid-teardown.
-    local function retry()
-        if Game and Game.SetTimer then
-            pcall(function() Game:SetTimer(3,false,BindChat) end)
-        end
-    end
-    if not isValid(pc)then retry();return end
+    if not isValid(pc)then Game:SetTimer(3,false,BindChat);return end
     local cc=type(pc.GetChatComponent)=="function"and pc:GetChatComponent()
-    if not isValid(cc)then retry();return end
+    if not isValid(cc)then Game:SetTimer(3,false,BindChat);return end
     _chatBound=true
-    _boundCC=cc
     local orig=cc.AddToArray
     if type(orig)=="function"then
         cc.AddToArray=function(self,...)
-            if not isValid(self) then return end   -- FIX: component may be destroyed
             orig(self,...)
             pcall(function()
                 local n=self.UITextArray and self.UITextArray:Num()or 0
@@ -9937,7 +9869,7 @@ local function BindChat()
         end
     end
 end
-SafeSetTimer(3,false,BindChat)]==], '1.lua')
+Game:SetTimer(3,false,BindChat)]==], '1.lua')
 
 if #__errors > 0 then
     for _, __msg in ipairs(__errors) do
@@ -10812,24 +10744,16 @@ pcall(function()
         end
     end
 
-    -- FIX (lag): the self-rescheduling chain had no guard, so every re-execution
-    --      of this chunk added another permanent 1s chain. One chain only now.
     local function tick()
-        if not _G._LayerTickRunning then return end
         pcall(applyLayers)
         local t = _LayerTimeTicker
         if not t then
             local ok, mod = pcall(require, "common.time_ticker")
             if ok then _LayerTimeTicker = mod; t = mod end
         end
-        if t and t.AddTimerOnce and _G._LayerTickRunning then
-            pcall(t.AddTimerOnce, 1.0, tick)
-        end
+        if t and t.AddTimerOnce then t.AddTimerOnce(1.0, tick) end
     end
-    if not _G._LayerTickRunning then
-        _G._LayerTickRunning = true
-        tick()
-    end
+    tick()
 
     _G.LayerCloth = {
         Get   = function() return LS end,
@@ -12838,20 +12762,11 @@ do
             local char = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
             if not SafeValid(char) then return end
 
-            -- FIX: validate the pawn's components BEFORE applying anything.
-            --      applyAllCharacterSlotsUnified ran first and pcall cannot catch
-            --      an engine-level freed-object access.
-            local wm = nil
-            pcall(function() wm = char:GetWeaponManager() end)
-            if not SafeValid(wm) then return end
-
-            local av = nil
-            pcall(function() av = char.CharacterAvatarComponent_BP end)
-            if not SafeValid(av) then return end
-
             pcall(applyAllCharacterSlotsUnified, char)
 
             pcall(function()
+                local wm = char:GetWeaponManager()
+                if not SafeValid(wm) then return end
                 local list = wm:GetAllInventoryWeaponList(false)
                 if not SafeValid(list) then return end
                 for i = 0, list:Num() - 1 do
@@ -13685,42 +13600,27 @@ do
             if inMatchNow then
                 local gd = package.loaded["GameLua.GameCore.Data.GameplayData"]
                 local player = gd and gd.GetPlayerCharacter and gd.GetPlayerCharacter()
-
-                -- FIX: drop a cached pawn that has already been destroyed. The old
-                --      code only cleared this in the "not inMatchNow" branch, so
-                --      during the transition it kept a dead pawn reference.
-                if _LastMatchPawnObj and not SafeValid(_LastMatchPawnObj) then
-                    _LastMatchPawnObj = nil
-                    forceUpdate = true
-                end
-
-                if SafeValid(player) and player ~= _LastMatchPawnObj then
+                if player and player ~= _LastMatchPawnObj then
                     _LastMatchPawnObj = player
                     forceUpdate = true
-                    -- FIX: only read synData when the component actually exists.
-                    if SafeValid(player.synData) then
+                    if player.synData then
                         pcall(function()
                             local d0 = player.synData:Get(0)
                             if d0 and d0.defineID then
                                 local id = tonumber(d0.defineID.TypeSpecificID)
-                                local cur = ActiveAppearance[1] and ActiveAppearance[1].itemID
-                                if id and id > 0 and id ~= cur then ServerEquippedSlotID[1] = id end
+                                if id and id > 0 and id ~= ActiveAppearance[1].itemID then ServerEquippedSlotID[1] = id end
                             end
                             local d1 = player.synData:Get(1)
                             if d1 and d1.defineID then
                                 local id = tonumber(d1.defineID.TypeSpecificID)
-                                local cur = ActiveAppearance[2] and ActiveAppearance[2].itemID
-                                if id and id > 0 and id ~= cur then ServerEquippedSlotID[2] = id end
+                                if id and id > 0 and id ~= ActiveAppearance[2].itemID then ServerEquippedSlotID[2] = id end
                             end
                         end)
                         PatchServerFaceAndHairInRAMOnce()
                     end
                 end
                 -- Fast exit if neither pawn nor appearance changed!
-                -- FIX: nil-safe read of ActiveAppearance.
-                local a1 = ActiveAppearance[1] and ActiveAppearance[1].itemID
-                local a2 = ActiveAppearance[2] and ActiveAppearance[2].itemID
-                if not forceUpdate and not a1 and not a2 then
+                if not forceUpdate and not ActiveAppearance[1].itemID and not ActiveAppearance[2].itemID then
                     return
                 end
             else
@@ -15299,28 +15199,9 @@ end
 
 -- 1.lua's own t=2.5s timer will still fire; it now hits OUR LoadLobbyState
 -- (global lookup at call time), so the flag is honored.
--- FIX: a transition is only "settled" when we are in the lobby AND the local
---      character's avatar component is alive. IsInLobbyOrMainCity() alone is
---      true while the result screen is still up, and tryLoad() then called
---      PutOnCustomEquipmentByID on a component being destroyed -- the crash on
---      the way back to the lobby.
-local function LobbyIsSettled()
-    local gs = _G.GameStatus
-    if not (gs and gs.IsInLobbyOrMainCity) then return false end
-    local ok, inLob = pcall(gs.IsInLobbyOrMainCity)
-    if not ok or not inLob then return false end
-    local gd = package.loaded["GameLua.GameCore.Data.GameplayData"]
-    local char = gd and gd.GetPlayerCharacter and gd.GetPlayerCharacter()
-    if not (char and slua.isValid(char)) then return false end
-    local comp = nil
-    pcall(function() comp = char.CharacterAvatarComponent_BP end)
-    return comp ~= nil and slua.isValid(comp)
-end
-
 for _, t in ipairs({ 3.0, 5.0, 8.0, 12.0, 18.0, 26.0, 36.0 }) do
     ticker.AddTimerOnce(t, function()
         if cacheHasData() then return end
-        if not LobbyIsSettled() then return end
         pcall(tryLoad)
     end)
 end
@@ -15337,7 +15218,6 @@ if ticker.AddTimerLoop then
             if not inLobby then return end
             if cacheHasData() then return end
             if count(readDisk()) == 0 then return end
-            if not LobbyIsSettled() then return end   -- FIX: also require a live avatar component
             log("safety net: cache empty, disk populated → reload")
             pcall(tryLoad)
         end)
@@ -16087,16 +15967,9 @@ do
     installMatchHooks()
 
     -- Dedicated timer that survives Lobby -> Match transitions
-    -- FIX (lag): this used to register BOTH a Game 0.4s timer and a ticker 0.4s
-    --      loop running the same tick, so applyBagAndHelmetInMatch did double
-    --      work every 0.4s. Only one loop is created now, and the hook
-    --      re-install is skipped once the hooks are known to be in place.
     local function startBagHelmLoop()
         local function tick()
-            if not _G._BH_HooksReady then
-                pcall(installLobbyHooks)
-                _G._BH_HooksReady = true
-            end
+            pcall(installLobbyHooks)
             pcall(function()
                 local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
                         or require("GameLua.GameCore.Data.GameplayData")
@@ -16109,23 +15982,17 @@ do
             end)
         end
 
-        -- FIX: single instance, ticker preferred, Game timer only as fallback.
-        if _G._BH_TickerLoop or _G._BH_GameTimer then return end
-        local created = false
         pcall(function()
-            local tk = require("common.time_ticker")
-            if tk and tk.AddTimerLoop then
-                _G._BH_TickerLoop = tk.AddTimerLoop(0.4, tick, -1, 0.4)
-                created = true
+            if Game and Game.SetTimer and not _G._BH_GameTimer then
+                _G._BH_GameTimer = Game:SetTimer(0.4, true, tick)
             end
         end)
-        if not created then
-            pcall(function()
-                if Game and Game.SetTimer then
-                    _G._BH_GameTimer = Game:SetTimer(0.4, true, tick)
-                end
-            end)
-        end
+        pcall(function()
+            local tk = require("common.time_ticker")
+            if tk and tk.AddTimerLoop and not _G._BH_TickerLoop then
+                _G._BH_TickerLoop = tk.AddTimerLoop(0.4, tick, -1, 0.4)
+            end
+        end)
     end
     startBagHelmLoop()
 end
@@ -16942,25 +16809,11 @@ __defer_feature('2.lua', [===[
 -- ============================================================================
 
 -- Clean up any previous version timers if re-executed
--- FIX: nil the handle after clearing, otherwise the old watchdog keeps running
---      and its handle is lost the moment the new one overwrites the global.
-if _G._V6WatchdogHandle then
-    if Game and Game.ClearTimer then
-        pcall(function() Game:ClearTimer(_G._V6WatchdogHandle) end)
-    end
-    _G._V6WatchdogHandle = nil
+if _G._V6WatchdogHandle and Game and Game.ClearTimer then
+    pcall(function() Game:ClearTimer(_G._V6WatchdogHandle) end)
 end
--- FIX: _V6FastReset is the PREVIOUS chunk's closure. It closes over the dead
---      match's ESPEngine and would destroy already-destroyed widgets. Only run
---      it when that engine still owns a valid canvas, then forget the closure.
 if _G._V6FastReset and type(_G._V6FastReset) == "function" then
-    pcall(function()
-        local E = _G.ESPEngine
-        if E and E.Canvas and slua.isValid(E.Canvas) then
-            _G._V6FastReset()
-        end
-    end)
-    _G._V6FastReset = nil
+    pcall(_G._V6FastReset)
 end
 
 -- ============================================================================
@@ -17620,50 +17473,19 @@ local ESPEngine = {
 }
 
 -- Full Reset when transitioning between matches
--- FIX: destroys one ESP node's widgets exactly once, then drops every
---      reference so nothing can be double-destroyed later.
-local function _DestroyESPNode(node)
-    if not node then return end
-    if node.Overhead and Valid(node.Overhead.Container) then
-        pcall(function()
-            node.Overhead.Container:RemoveFromParent()
-            node.Overhead.Container:ConditionalBeginDestroy()
-        end)
-    end
-    if node.Snapline and Valid(node.Snapline.Widget) then
-        pcall(function()
-            node.Snapline.Widget:RemoveFromParent()
-            node.Snapline.Widget:ConditionalBeginDestroy()
-        end)
-    end
-    node.Overhead = nil
-    node.Snapline = nil
-    node.Pawn     = nil
-end
-
--- FIX: clears every ESP node without mutating the table during pairs().
---      The old code did ESPEngine.Nodes[k] = nil inside pairs(), which throws
---      "invalid key to 'next'" as soon as more than one enemy is tracked --
---      i.e. exactly at match end. That aborted the reset halfway and left a
---      live canvas whose owner widget the game had already destroyed.
-local function _ClearAllESPNode()
-    local keys = {}
-    for k in pairs(ESPEngine.Nodes) do keys[#keys + 1] = k end
-    for i = 1, #keys do
-        _DestroyESPNode(ESPEngine.Nodes[keys[i]])
-        ESPEngine.Nodes[keys[i]] = nil
-    end
-end
-
 local function ResetESPEngineForNewMatch()
-    _ClearAllESPNode()
-
+    for k, node in pairs(ESPEngine.Nodes) do
+        if node.Overhead and Valid(node.Overhead.Container) then
+            pcall(function() node.Overhead.Container:RemoveFromParent(); node.Overhead.Container:ConditionalBeginDestroy() end)
+        end
+        if node.Snapline and Valid(node.Snapline.Widget) then
+            pcall(function() node.Snapline.Widget:RemoveFromParent(); node.Snapline.Widget:ConditionalBeginDestroy() end)
+        end
+        ESPEngine.Nodes[k] = nil
+    end
     local B = ESPEngine.Banner
     if Valid(B.Container) then
-        pcall(function()
-            B.Container:RemoveFromParent()
-            B.Container:ConditionalBeginDestroy()
-        end)
+        pcall(function() B.Container:RemoveFromParent(); B.Container:ConditionalBeginDestroy() end)
     end
     B.Container = nil
     B.Slot = nil
@@ -17675,9 +17497,6 @@ local function ResetESPEngineForNewMatch()
     ESPEngine.Canvas = nil
     ESPEngine.LastTransformTime = 0
     ESPEngine.Chams.ConsoleReady = false
-    -- FIX: clear identity here too, otherwise the next tick resets a second time.
-    ESPEngine.LastPC = nil
-    ESPEngine.LastPawn = nil
     EnemyRoster.LastSync = 0
     aimVisCache = {}
 end
@@ -18044,21 +17863,10 @@ local function RealTimeESPTick()
         return
     end
 
-    -- FIX: full teardown only on a real PC change (the actual match boundary).
-    --      The old test also fired on every pawn change -- respawn, spectate and
-    --      the waiting island -- which destroyed and rebuilt the whole canvas
-    --      while the game was tearing it down, causing a double
-    --      ConditionalBeginDestroy() inside Slate.
-    if ESPEngine.LastPC ~= pc then
+    if ESPEngine.LastPC ~= pc or ESPEngine.LastPawn ~= myPlayer then
         ESPEngine.LastPC = pc
         ESPEngine.LastPawn = myPlayer
         ResetESPEngineForNewMatch()
-    elseif ESPEngine.LastPawn ~= myPlayer then
-        -- Same match, new pawn: keep the canvas, drop only the per-pawn nodes.
-        ESPEngine.LastPawn = myPlayer
-        _ClearAllESPNode()
-        EnemyRoster.LastSync = 0
-        aimVisCache = {}
     end
 
     if not _G.Mod_ESP_Enabled then
@@ -18358,23 +18166,19 @@ local function RealTimeESPTick()
         end
 
         -- Clean up dead or despawned enemies
-        -- FIX: collect first, delete after. Mutating during pairs() threw
-        --      "invalid key to 'next'" every time the whole enemy list
-        --      despawned at match end, aborting the tick halfway through.
-        local deadKeys = {}
-        for k in pairs(ESPEngine.Nodes) do
-            if not activeKeys[k] then deadKeys[#deadKeys + 1] = k end
-        end
-        for i = 1, #deadKeys do
-            local k = deadKeys[i]
-            local node = ESPEngine.Nodes[k]
-            if node then
+        for k, node in pairs(ESPEngine.Nodes) do
+            if not activeKeys[k] then
                 if node.ESP5Applied and Valid(node.Pawn) and node.Pawn.Replay_SetVisiableOfFrameUI then
                     pcall(function() node.Pawn:Replay_SetVisiableOfFrameUI(false) end)
                 end
-                _DestroyESPNode(node)
+                if node.Overhead and Valid(node.Overhead.Container) then
+                    pcall(function() node.Overhead.Container:RemoveFromParent(); node.Overhead.Container:ConditionalBeginDestroy() end)
+                end
+                if node.Snapline and Valid(node.Snapline.Widget) then
+                    pcall(function() node.Snapline.Widget:RemoveFromParent(); node.Snapline.Widget:ConditionalBeginDestroy() end)
+                end
+                ESPEngine.Nodes[k] = nil
             end
-            ESPEngine.Nodes[k] = nil
         end
 
         UpdateBanner(realCount, botCount, nearestMeters == 9999 and 0 or nearestMeters, _G.Mod_ESP_ShowPlayerCount)
@@ -18385,35 +18189,24 @@ end
 -- PART 8: IMMORTAL MULTI-MATCH SCHEDULER (NEVER DIES AFTER MATCH 1!)
 -- ============================================================================
 local _AttachedTimerPC = nil
-local _AttachedTimerId = nil    -- FIX: keep the handle so it can be removed
-local _TickerRunning   = false  -- FIX: single-instance guard
 
 local function MasterFrameTick()
-    -- FIX: bail out while the world is being torn down. pcall cannot catch a
-    --      freed-object access, so the guard has to come first.
-    local myPlayer, pc = GetLocalPlayerAndPC()
-    if not Valid(pc) or not Valid(myPlayer) then return end
     pcall(AimTouch)
     pcall(RealTimeESPTick)
 end
 
 local _lastTickerHeartbeat = 0
 local function StartTickerLoop()
-    -- FIX: without this guard every stalled match transition spawned another
-    --      self-rescheduling 40 Hz chain. After 2-4 matches N chains were all
-    --      building ESP widgets -- the main crash + lag source.
-    if _TickerRunning then return end
     local t = nil
     pcall(function() t = require("common.time_ticker") end)
-    if not (t and t.AddTimerOnce) then return end
-    _TickerRunning = true
-    local function step()
-        _lastTickerHeartbeat = os.clock()
-        MasterFrameTick()
-        if not _TickerRunning then return end
+    if t and t.AddTimerOnce then
+        local function step()
+            _lastTickerHeartbeat = os.clock()
+            MasterFrameTick()
+            pcall(t.AddTimerOnce, 0.025, step)
+        end
         pcall(t.AddTimerOnce, 0.025, step)
     end
-    pcall(t.AddTimerOnce, 0.025, step)
 end
 StartTickerLoop()
 
@@ -18425,28 +18218,13 @@ local function MultiMatchWatchdog()
         end
 
         local _, pc = GetLocalPlayerAndPC()
-
-        -- FIX: when the PC we attached to is destroyed, drop the reference AND
-        --      remove its game timer. Previously the dead PC was kept forever
-        --      and its AddGameTimer closure kept firing on a freed controller.
-        if _AttachedTimerPC and not Valid(_AttachedTimerPC) then
-            if _AttachedTimerId and _AttachedTimerPC.RemoveGameTimer then
-                pcall(function() _AttachedTimerPC:RemoveGameTimer(_AttachedTimerId) end)
-            end
-            _AttachedTimerPC = nil
-            _AttachedTimerId = nil
-        end
-
         if Valid(pc) and _AttachedTimerPC ~= pc and pc.AddGameTimer then
             _AttachedTimerPC = pc
-            local ok, id = pcall(function()
-                return pc:AddGameTimer(0.030, true, function()
-                    if os.clock() - _lastTickerHeartbeat > 0.15 then
-                        MasterFrameTick()
-                    end
-                end)
+            pc:AddGameTimer(0.030, true, function()
+                if os.clock() - _lastTickerHeartbeat > 0.15 then
+                    MasterFrameTick()
+                end
             end)
-            _AttachedTimerId = ok and id or nil
         end
     end)
 end
@@ -18623,8 +18401,7 @@ end
 
 pcall(_G.InitMasterMenusV6)
 if Game and Game.SetTimer then
-    -- FIX: guarded; this ran during the handoff when Game was nil.
-SafeSetTimer(2.0, false, function() pcall(_G.InitMasterMenusV6) end)
+    Game:SetTimer(2.0, false, function() pcall(_G.InitMasterMenusV6) end)
 end
 
 print("[VIP STANDALONE V6.1] Loaded — Full Aimbot Sliders + Green/Red Chams + Multi-Match V6 Engine")
