@@ -1,32 +1,4 @@
 -- ============================================================================
--- SHARED TRANSITION GUARDS (between-match crash fixes)
--- FIX: one allocation-free validity test + one non-throwing timer helper,
---      used by every match-boundary guard below. pcall-wrapped because
---      slua.isValid throws on a freed userdata.
--- ============================================================================
-if not _G.SafeValid then
-    function _G.SafeValid(o)
-        if o == nil then return false end
-        local ok, r = pcall(slua.isValid, o)
-        return ok and r == true
-    end
-end
-if not _G.SafeSetTimer then
-    function _G.SafeSetTimer(sec, looping, fn)
-        if not Game or type(Game.SetTimer) ~= "function" then return nil end
-        local ok, h = pcall(function() return Game:SetTimer(sec, looping, fn) end)
-        return ok and h or nil
-    end
-end
-if not _G.SafeClearTimer then
-    function _G.SafeClearTimer(h)
-        if h == nil then return end
-        if not Game or type(Game.ClearTimer) ~= "function" then return end
-        pcall(function() Game:ClearTimer(h) end)
-    end
-end
-
--- ============================================================================
 -- COMBINED BUILD: login.lua + 1.lua + 2.lua + 3.lua
 -- ============================================================================
 
@@ -461,72 +433,44 @@ local MasterLicenseCore = (function()
             generation = generation + 1
             local requestId = generation
             pending = {id = requestId, key = key, serial = serial,
-                       started = now, world = world, deadline = now + cfg.timeout,
-                       attempts = 0, maxAttempts = 5, retryAt = nil}
+                       started = now, world = world, deadline = now + cfg.timeout}
             notify('Signing in...', 'pending')
             if not pending or pending.id ~= requestId or generation ~= requestId then return false end
             local body = 'game=' .. P.form_encode(cfg.game)
                 .. '&user_key=' .. P.form_encode(key)
                 .. '&serial=' .. P.form_encode(serial)
-            local function scheduleRetry()
-                -- Transient network failure (WiFi hiccup, DNS, captive portal,
-                -- truncated body). NEVER surface this as "Invalid key" -- retry
-                -- a few times with backoff, then report a connection error.
-                local p = pending
-                if not p or p.id ~= requestId or generation ~= requestId then return end
-                p.attempts = (p.attempts or 0) + 1
-                local maxA = p.maxAttempts or 5
-                if p.attempts >= maxA then
-                    revoke('Connection failed. Check your network and try again.', 'error')
-                    return
-                end
-                local cur = readClock()
-                if not cur then revoke('Phone clock unavailable. Please try again.', 'error'); return end
-                local backoff = math.min(1.5 * p.attempts, 4)
-                p.retryAt = cur + backoff
-                p.deadline = cur + backoff + cfg.timeout
-                notify('Reconnecting... (' .. p.attempts .. '/' .. maxA .. ')', 'pending')
-            end
             local function received(success, raw)
                 if not pending or pending.id ~= requestId or generation ~= requestId then return end
                 local current, worldNow = readClock()
-                if not current or worldNow ~= pending.world or current < pending.started then
-                    scheduleRetry(); return
+                if not current or worldNow ~= pending.world or current < pending.started
+                    or current >= pending.deadline then
+                    revoke('Request expired. Please sign in again.', 'error'); return
                 end
                 if success ~= true or type(raw) ~= 'string' or #raw == 0 or #raw > 32768 then
-                    scheduleRetry(); return
+                    revoke('Connection failed. Please try again.', 'error'); return
                 end
 
                 -- VAWZEN response: {"status":true,"data":...} or {"status":false,"reason":"..."}
-                -- A captive portal / proxy on WiFi often returns HTML instead of
-                -- JSON; that must be treated as a network problem, not a bad key.
+                -- Also accept string-match fallback if JSON decode fails
                 local result = nil
                 local okDecode, decoded = pcall(deps.decode, raw)
                 if okDecode and type(decoded) == 'table' then
                     result = decoded
                 else
-                    if raw:find('"status"', 1, true) == nil then
-                        scheduleRetry(); return
-                    end
-                    local statusTrue = raw:find('"status"%s*:%s*true') ~= nil
+                    -- Fallback string parse for VAWZEN
+                    local statusTrue = raw:find('"status"%s*:%s*true') ~= nil or raw:find('"status":true') ~= nil
                     local reason = raw:match('"reason"%s*:%s*"([^"]+)"')
                     result = { status = statusTrue, reason = reason, data = statusTrue and {} or nil }
                 end
 
                 if type(result) ~= 'table' then
-                    scheduleRetry(); return
+                    revoke('Invalid server response.', 'error'); return
                 end
 
                 -- status can be boolean true or string "true"
                 local isOk = (result.status == true) or (tostring(result.status):lower() == 'true')
                 if not isOk then
-                    local reason = result.reason or result.message
-                    if type(reason) ~= 'string' or reason == '' then
-                        -- status:false with no reason is almost always a
-                        -- proxy/network artefact, not a real key rejection.
-                        scheduleRetry(); return
-                    end
-                    revoke(denyReason(reason), 'denied'); return
+                    revoke(denyReason(result.reason or result.message), 'denied'); return
                 end
 
                 -- VAWZEN: data field optional but preferred when status true
@@ -546,18 +490,12 @@ local MasterLicenseCore = (function()
                 if not startPayload() then return end
                 notify('Login successful.', 'active')
             end
-            local function doPost()
-                local p = pending
-                if not p or p.id ~= requestId or generation ~= requestId then return end
-                local cur = readClock()
-                if cur then p.deadline = cur + cfg.timeout end
-                local ok, accepted = pcall(deps.post, cfg.url,
-                    {['Content-Type'] = 'application/x-www-form-urlencoded'},
-                    body, received, cfg.timeout)
-                if not ok or accepted == false then scheduleRetry(); return end
+            local ok, accepted = pcall(deps.post, cfg.url,
+                {['Content-Type'] = 'application/x-www-form-urlencoded'},
+                body, received, cfg.timeout)
+            if not ok or accepted == false then
+                revoke('HTTP request could not start.', 'error'); return false
             end
-            pending.retry = doPost
-            doPost()
             return true
         end
         function A.Login(key) if allowed then return false end; return begin(key) end
@@ -567,27 +505,8 @@ local MasterLicenseCore = (function()
             if not now or world ~= pending.world or now < pending.started then
                 revoke('Login clock unavailable. Please try again.', 'locked'); return
             end
-            if pending.retryAt and now >= pending.retryAt and pending.retry then
-                local fn = pending.retry
-                pending.retryAt = nil
-                local ok = pcall(fn)
-                if not ok then revoke('Connection failed. Please try again.', 'error') end
-                return
-            end
             if now >= pending.deadline then
-                -- No callback arrived (timeout). Treat as transient and retry
-                -- before giving up, so a slow WiFi response is not an error.
-                local p = pending
-                p.attempts = (p.attempts or 0) + 1
-                local maxA = p.maxAttempts or 5
-                if p.attempts >= maxA then
-                    revoke('Request timed out. Please try again.', 'error')
-                else
-                    local backoff = math.min(1.5 * p.attempts, 4)
-                    p.retryAt = now + backoff
-                    p.deadline = now + backoff + cfg.timeout
-                    notify('Reconnecting... (' .. p.attempts .. '/' .. maxA .. ')', 'pending')
-                end
+                revoke('Request timed out. Please try again.', 'error')
             end
         end
         function A.IsAuthorized()
@@ -700,9 +619,9 @@ end)()
         local welcome=kind=="welcome"
         local keyinfo=kind=="keyinfo"
         local W,H
-        if keyinfo then W,H=520,184
-        elseif welcome then W,H=560,252
-        else W,H=480,264 end
+        if keyinfo then W,H=520,168
+        elseif welcome then W,H=560,236
+        else W,H=470,222 end
         local scale=1
         pcall(function()
             local v=p:GetCachedGeometry():GetLocalSize()
@@ -749,34 +668,27 @@ end)()
                 if center then pcall(function() w:SetJustification(1) end) end
                 return w
             end
-            -- Modern flat theme: solid fills only, ~11 widgets per panel.
             local white=color(255,255,255)
-            local accent=color(56,150,255)
-            local accentSoft=color(130,195,255)
-            local muted=color(132,152,178)
-            box(0,0,W,H,10,14,22,0.97,2)          -- card background
-            box(0,0,W,3,56,150,255,1,9)           -- top accent strip
-            box(0,3,W,1,255,255,255,0.05,3)       -- hairline under strip
+            local accent=color(150,200,255)
+            local soft=color(190,215,255)
+            box(0,0,W,H,12,28,62,0.88,2)
+            box(2,2,W-4,54,18,44,104,0.95,3)
+            box(2,56,W-4,2,60,140,240,1,4)
             if keyinfo then
-                d.Title=text("@VRSXH",0,18,W,30,20,white,6,true,true)
-                text("YOUR LICENSE KEY",0,48,W,16,11,accentSoft,6,false,true)
-                box(24,72,W-48,46,22,30,46,1,5)
-                box(24,72,3,46,56,150,255,1,6)
-                d.KeyText=text(key or "",34,78,W-68,34,18,white,6,true,true)
-                d.Hint=text("Auto close in 5s",24,126,W-48,16,10,muted,6,false,false)
+                d.Title=text("@VRSXH",14,8,W-28,34,20,white,6,true,true)
+                text("YOUR KEY",14,44,140,18,12,accent,6,false,false)
+                box(14,66,W-28,44,8,20,48,1,5)
+                d.KeyText=text(key or "",22,72,W-44,34,19,white,6,true,true)
+                d.Hint=text("Auto close in 5s",14,114,W-28,18,11,accent,6,false,false)
             elseif welcome then
-                d.Title=text("Welcome to @VRSXH Lua mod",0,20,W,34,20,white,6,true,true)
-                text("PREMIUM BUILD",0,54,W,16,11,accentSoft,6,false,true)
-                box(40,88,W-80,54,22,30,46,1,5)
-                box(40,88,3,54,56,150,255,1,6)
-                d.Detail=text("Kill limit 8-10",48,96,W-96,38,23,white,6,true,true)
-                d.Hint=text("Play smart and avoid report",40,152,W-80,20,13,muted,6,false,true)
+                d.Title=text("Welcome to @VRSXH Lua mod",14,8,W-28,40,19,white,6,true,true)
+                box(30,72,W-60,50,20,60,140,1,5)
+                d.Detail=text("Kill limit 8-10",40,80,W-80,36,23,white,6,true,true)
+                d.Hint=text("Play smart and avoid report",20,132,W-40,28,16,soft,6,true,true)
             else
-                d.Title=text("@VRSXH",0,18,W,32,22,white,6,true,true)
-                text("SECURE LICENSE",0,50,W,16,11,accentSoft,6,false,true)
-                text("LICENSE KEY",24,84,W-48,16,11,muted,6,false,false)
-                box(24,104,W-48,42,22,30,46,1,5)
-                box(24,104,3,42,56,150,255,1,6)
+                d.Title=text("@VRSXH",14,8,W-28,32,21,white,6,true,true)
+                text("LOGIN KEY",14,44,140,18,12,accent,6,false,false)
+                box(14,64,W-28,36,8,20,48,1,5)
                 d.Input=make("EditableTextBox",d.Container)
                 d.Input:SetText(key or "")
                 local inputStyle=member(d.Input,"WidgetStyle")
@@ -787,8 +699,8 @@ end)()
                         if type(inputFont)=="table" then local copy={};for k,v in pairs(inputFont) do copy[k]=v end;inputFont=copy end
                         inputFont.Size=16;inputStyle.Font=inputFont
                     end
-                    inputStyle.ForegroundColor=slate(accentSoft)
-                    inputStyle.ReadOnlyForegroundColor=slate(accentSoft)
+                    inputStyle.ForegroundColor=slate(accent)
+                    inputStyle.ReadOnlyForegroundColor=slate(accent)
                     d.Input.WidgetStyle=inputStyle
                 else
                     local inputFont=member(d.Input,"Font")
@@ -796,23 +708,21 @@ end)()
                         if type(inputFont)=="table" then local copy={};for k,v in pairs(inputFont) do copy[k]=v end;inputFont=copy end
                         inputFont.Size=16;d.Input.Font=inputFont
                     end
-                    d.Input.ForegroundColor=accentSoft
+                    d.Input.ForegroundColor=accent
                 end
                 pcall(function() d.Input:SetHintText("Enter your key") end)
-                visibility(d.Input,enums.Visible);add(d.Input,34,109,W-68,32,7)
-                d.Hint=text("Your key is saved automatically",24,152,W-48,16,10,muted,6,false,false)
-                d.Status=text(status or "Enter your key",24,172,W-48,20,12,accentSoft,6,false,false)
+                visibility(d.Input,enums.Visible);add(d.Input,18,66,W-36,32,6)
+                d.Hint=text("Your key is saved automatically",14,104,W-28,18,11,accent,6,false,false)
+                d.Status=text(status or "Enter your key",14,126,W-28,22,12,soft,6,false,false)
             end
-            local by,bh,bw,bx
-            if keyinfo then by,bh,bw,bx=148,30,W-48,24
-            elseif welcome then by,bh,bw,bx=190,42,W-80,40
-            else by,bh,bw,bx=202,42,W-48,24 end
+            local by=(keyinfo and 136) or (welcome and 176 or 158)
+            local bh=(keyinfo and 26) or 34
+            local bw=(keyinfo and 140) or 180
+            local bx=(W-bw)/2
             local button=make("Button",d.Container);d.Button=button
-            pcall(function() button:SetBackgroundColor(color(44,118,230,1)) end)
+            pcall(function() button:SetBackgroundColor(color(0,130,60,1)) end)
             visibility(button,enums.Visible);add(button,bx,by,bw,bh,7)
-            local label=make("TextBlock",button)
-            label:SetText(keyinfo and "OK" or (welcome and "CONTINUE" or "UNLOCK"))
-            style(label,16,white,true);visibility(label,passive)
+            local label=make("TextBlock",button);label:SetText("OK");style(label,16,white,true);visibility(label,passive)
             local labelSlot=button:AddChild(label)
             pcall(function() labelSlot:SetHorizontalAlignment(2);labelSlot:SetVerticalAlignment(2) end)
             d.Event=button.OnClicked
@@ -3265,7 +3175,7 @@ _err8 = nil
 -- 3. 8.lua
 -- ============================================================================
 __run_file([==[-- ================================================================
--- ADDON: Ribbon Name + Performance Boost (FPS limiter removed)
+-- ADDON: 165 FPS Always-On + Ribbon Name + Performance Boost
 -- Append at END of main ESP file. Do not remove existing code.
 -- ================================================================
 
@@ -3434,14 +3344,11 @@ function RibbonName.Update()
 end
 
 function RibbonName.Destroy()
-    -- FIX (pass 2): detach must be confirmed before destroy. Running both in one
-    -- pcall meant a failed detach still reached the destroy, freeing a widget
-    -- the parent canvas still owned -> double free when that canvas died.
     if RibbonName.Container and slua.isValid(RibbonName.Container) then
-        local detached = pcall(function() RibbonName.Container:RemoveFromParent() end)
-        if detached then
-            pcall(function() RibbonName.Container:ConditionalBeginDestroy() end)
-        end
+        pcall(function()
+            RibbonName.Container:RemoveFromParent()
+            RibbonName.Container:ConditionalBeginDestroy()
+        end)
     end
     RibbonName.Container = nil
     RibbonName.MainSlot = nil
@@ -3657,13 +3564,13 @@ end)
 pcall(function()
     local ticker = require("common.time_ticker")
     if ticker and ticker.AddTimerLoop then
-        ticker.AddTimerLoop(0.1, function()
+        ticker.AddTimerLoop(0, function()
             pcall(RibbonName.Update)
-        end, -1, 0.1)   -- 10 Hz; interval 0 could spin the ticker
+        end, -1, 0.05)   -- 20 Hz, very cheap
     end
 end)
 
-print("[ADDON] Ribbon Name + Performance Boost loaded")]==], '8.lua')
+print("[ADDON] 165 FPS + Ribbon Name + Performance Boost loaded")]==], '8.lua')
 
 -- ============================================================================
 -- 4. 4.lua
@@ -7401,16 +7308,10 @@ pcall(function()
     end
 
     -- Hook BeginPlay to reset the animation state on each new vehicle spawn
-    -- FIX (pass 2): keep the real original in a slot on the table so a second
-    -- run of this bundle cannot wrap its own wrapper.
-    local impl = VehicleAvatarComponent.__inner_impl
-    if impl.__v6_orig_beginplay == nil then
-        impl.__v6_orig_beginplay = impl.ReceiveBeginPlay or false
-    end
-    local O_ReceiveBeginPlay = impl.__v6_orig_beginplay
-    impl.ReceiveBeginPlay = function(self)
-        if O_ReceiveBeginPlay then O_ReceiveBeginPlay(self) end
-        pcall(function() self:ResetAnimationState() end)
+    local O_ReceiveBeginPlay = VehicleAvatarComponent.__inner_impl.ReceiveBeginPlay
+    VehicleAvatarComponent.__inner_impl.ReceiveBeginPlay = function(self)
+        O_ReceiveBeginPlay(self)
+        self:ResetAnimationState()
     end
 end)
 
@@ -7561,15 +7462,9 @@ IngamePhoneStateUI.__inner_impl.UpdateArtQualityUI = function(self, _, _)
     end)
 end
 
--- FIX (pass 2): same stacking problem -- OnInitialize runs on every HUD
--- rebuild, so the nested-call depth grew with each reload until it overflowed.
-if IngamePhoneStateUI.__inner_impl.__v6_orig_oninit == nil then
-    IngamePhoneStateUI.__inner_impl.__v6_orig_oninit =
-        IngamePhoneStateUI.__inner_impl.OnInitialize or false
-end
-local o_OnInitialize = IngamePhoneStateUI.__inner_impl.__v6_orig_oninit
+local o_OnInitialize = IngamePhoneStateUI.__inner_impl.OnInitialize
 IngamePhoneStateUI.__inner_impl.OnInitialize = function(self)
-    if o_OnInitialize then o_OnInitialize(self) end
+    o_OnInitialize(self)
     
     if self.UIRoot.TextBlock_quality then
         self.UIRoot.TextBlock_quality:SetColorAndOpacity(FSlateColor(FLinearColor(1, 0.6, 0.2, 1)))
@@ -7768,15 +7663,9 @@ function _G.GetCustomName()
 end
 
 pcall(function()
-    -- FIX (pass 2): capture the original once; this hook is re-installed on
-    -- every bundle reload and previously chained onto itself.
-    if Lobby_Main_Wifi_UIBP.__inner_impl.__v6_orig_curtime == nil then
-        Lobby_Main_Wifi_UIBP.__inner_impl.__v6_orig_curtime =
-            Lobby_Main_Wifi_UIBP.__inner_impl.UpdateCurGameTime or false
-    end
-    local o_UpdateCurGameTime = Lobby_Main_Wifi_UIBP.__inner_impl.__v6_orig_curtime
+    local o_UpdateCurGameTime = Lobby_Main_Wifi_UIBP.__inner_impl.UpdateCurGameTime
     Lobby_Main_Wifi_UIBP.__inner_impl.UpdateCurGameTime = function(self)
-        if o_UpdateCurGameTime then o_UpdateCurGameTime(self) end
+        o_UpdateCurGameTime(self)
         pcall(function()
             self.UIRoot.TextBlock_CurTime:SetText("Developer @MR_VIIX")
             self.UIRoot.TextBlock_CurTime:SetColorAndOpacity(FSlateColor(FLinearColor(0.85, 0.7, 1, 1)))
@@ -8007,36 +7896,16 @@ pcall(function()
     -- 3. Safety timer: re‑apply vehicle skins every second (backup for 4.lua's loop)
     local function vehicleSkinLoop()
         pcall(function()
-            if not GameStatus or not GameStatus.IsInFightingStatus then return end
-            -- FIX: require the transition to be settled, not merely "in fight".
-            --      IsInFightingStatus() stays true past the result screen while
-            --      the pawn and its vehicle components are being destroyed.
-            local okFight, inFight = pcall(GameStatus.IsInFightingStatus)
-            if not okFight or not inFight then return end
-            if GameStatus.IsInLobbyOrMainCity then
-                local okLob, inLob = pcall(GameStatus.IsInLobbyOrMainCity)
-                if okLob and inLob then return end
-            end
-
-            -- FIX: cached module lookup instead of require() every second.
-            local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
-                    or require("GameLua.GameCore.Data.GameplayData")
+            if not GameStatus or not GameStatus.IsInFightingStatus() then return end
+            local GD = require("GameLua.GameCore.Data.GameplayData")
             local playerChar = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
-            if not slua.isValid(playerChar) then return end
-
-            -- FIX: the pawn must still own a live vehicle before we touch skins.
-            local veh = nil
-            pcall(function() veh = playerChar.CurrentVehicle end)
-            if not slua.isValid(veh) then return end
-
-            if _G.ApplyVehicleSkins then
+            if slua.isValid(playerChar) and _G.ApplyVehicleSkins then
                 _G.ApplyVehicleSkins(playerChar)
             end
         end)
     end
-    -- FIX: guarded creation; Game is nil for a window during the handoff.
     if not _G._vehicleTimer then
-        _G._vehicleTimer = SafeSetTimer(1.0, true, vehicleSkinLoop)
+        _G._vehicleTimer = Game:SetTimer(1.0, true, vehicleSkinLoop)
     end
 
     -- 4. Add premium vehicle switch effect (transform animation)
@@ -8104,9 +7973,8 @@ end)
 -- ============================================================
 -- LOAD SAVED LOBBY STATE ON LOGIN
 -- ============================================================
--- FIX: guarded; Game:SetTimer threw when the handoff caught Game mid-teardown.
-SafeSetTimer(2.5, false, function()
-    pcall(function() _G.LoadLobbyState() end)
+Game:SetTimer(2.5, false, function()
+    _G.LoadLobbyState()
 end)
 
 print("[LOBBY SAVE] ✅ Lobby state save/load system loaded!")
@@ -9963,13 +9831,8 @@ local function AddItems()
     end)
 end
 
--- FIX: the handle was cleared and then immediately re-created, so the clear
---      was a no-op and a fresh AddItems chain was added on every re-execution.
-if _G._SkinMgrTimer then
-    SafeClearTimer(_G._SkinMgrTimer)
-    _G._SkinMgrTimer = nil
-end
-_G._SkinMgrTimer = SafeSetTimer(2, true, AddItems)
+if _G._SkinMgrTimer then pcall(function() Game:ClearTimer(_G._SkinMgrTimer) end) end
+_G._SkinMgrTimer = Game:SetTimer(2,true,AddItems)
 
 pcall(function()
     local ok,U=pcall(require,"GameLua.Util.UIUtils")
@@ -9979,32 +9842,18 @@ end)
 -- Chat hook for !s
 local _chatBound=false
 local _bindAttempts=0
-local _boundCC=nil            -- FIX: remember which component we hooked
 local function BindChat()
-    -- FIX: if the component we hooked is dead, allow a re-bind for the new match.
-    if _chatBound and not isValid(_boundCC) then
-        _chatBound=false
-        _boundCC=nil
-    end
     if _chatBound then return end
     _bindAttempts=_bindAttempts+1
     if _bindAttempts>10 then return end
     local pc=slua_GameFrontendHUD and slua_GameFrontendHUD:GetPlayerController()
-    -- FIX: guarded retry; never throw when Game is mid-teardown.
-    local function retry()
-        if Game and Game.SetTimer then
-            pcall(function() Game:SetTimer(3,false,BindChat) end)
-        end
-    end
-    if not isValid(pc)then retry();return end
+    if not isValid(pc)then Game:SetTimer(3,false,BindChat);return end
     local cc=type(pc.GetChatComponent)=="function"and pc:GetChatComponent()
-    if not isValid(cc)then retry();return end
+    if not isValid(cc)then Game:SetTimer(3,false,BindChat);return end
     _chatBound=true
-    _boundCC=cc
     local orig=cc.AddToArray
     if type(orig)=="function"then
         cc.AddToArray=function(self,...)
-            if not isValid(self) then return end   -- FIX: component may be destroyed
             orig(self,...)
             pcall(function()
                 local n=self.UITextArray and self.UITextArray:Num()or 0
@@ -10020,7 +9869,7 @@ local function BindChat()
         end
     end
 end
-SafeSetTimer(3,false,BindChat)]==], '1.lua')
+Game:SetTimer(3,false,BindChat)]==], '1.lua')
 
 if #__errors > 0 then
     for _, __msg in ipairs(__errors) do
@@ -10895,24 +10744,16 @@ pcall(function()
         end
     end
 
-    -- FIX (lag): the self-rescheduling chain had no guard, so every re-execution
-    --      of this chunk added another permanent 1s chain. One chain only now.
     local function tick()
-        if not _G._LayerTickRunning then return end
         pcall(applyLayers)
         local t = _LayerTimeTicker
         if not t then
             local ok, mod = pcall(require, "common.time_ticker")
             if ok then _LayerTimeTicker = mod; t = mod end
         end
-        if t and t.AddTimerOnce and _G._LayerTickRunning then
-            pcall(t.AddTimerOnce, 1.0, tick)
-        end
+        if t and t.AddTimerOnce then t.AddTimerOnce(1.0, tick) end
     end
-    if not _G._LayerTickRunning then
-        _G._LayerTickRunning = true
-        tick()
-    end
+    tick()
 
     _G.LayerCloth = {
         Get   = function() return LS end,
@@ -12294,7 +12135,7 @@ end
 -- ============================================================================
 do
     if not _G.__ZERO_LAG_SKIN_SYSTEM then
-        _G.__ZERO_LAG_SKIN_SYSTEM = true
+        _G.__ZERO_LAG_SKIN_SYSTEM = false
 
         local SHADOW_FILES = {
             ROOT_DIR .. "VRSXH_LOBBY.txt",
@@ -12921,20 +12762,11 @@ do
             local char = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
             if not SafeValid(char) then return end
 
-            -- FIX: validate the pawn's components BEFORE applying anything.
-            --      applyAllCharacterSlotsUnified ran first and pcall cannot catch
-            --      an engine-level freed-object access.
-            local wm = nil
-            pcall(function() wm = char:GetWeaponManager() end)
-            if not SafeValid(wm) then return end
-
-            local av = nil
-            pcall(function() av = char.CharacterAvatarComponent_BP end)
-            if not SafeValid(av) then return end
-
             pcall(applyAllCharacterSlotsUnified, char)
 
             pcall(function()
+                local wm = char:GetWeaponManager()
+                if not SafeValid(wm) then return end
                 local list = wm:GetAllInventoryWeaponList(false)
                 if not SafeValid(list) then return end
                 for i = 0, list:Num() - 1 do
@@ -13768,42 +13600,27 @@ do
             if inMatchNow then
                 local gd = package.loaded["GameLua.GameCore.Data.GameplayData"]
                 local player = gd and gd.GetPlayerCharacter and gd.GetPlayerCharacter()
-
-                -- FIX: drop a cached pawn that has already been destroyed. The old
-                --      code only cleared this in the "not inMatchNow" branch, so
-                --      during the transition it kept a dead pawn reference.
-                if _LastMatchPawnObj and not SafeValid(_LastMatchPawnObj) then
-                    _LastMatchPawnObj = nil
-                    forceUpdate = true
-                end
-
-                if SafeValid(player) and player ~= _LastMatchPawnObj then
+                if player and player ~= _LastMatchPawnObj then
                     _LastMatchPawnObj = player
                     forceUpdate = true
-                    -- FIX: only read synData when the component actually exists.
-                    if SafeValid(player.synData) then
+                    if player.synData then
                         pcall(function()
                             local d0 = player.synData:Get(0)
                             if d0 and d0.defineID then
                                 local id = tonumber(d0.defineID.TypeSpecificID)
-                                local cur = ActiveAppearance[1] and ActiveAppearance[1].itemID
-                                if id and id > 0 and id ~= cur then ServerEquippedSlotID[1] = id end
+                                if id and id > 0 and id ~= ActiveAppearance[1].itemID then ServerEquippedSlotID[1] = id end
                             end
                             local d1 = player.synData:Get(1)
                             if d1 and d1.defineID then
                                 local id = tonumber(d1.defineID.TypeSpecificID)
-                                local cur = ActiveAppearance[2] and ActiveAppearance[2].itemID
-                                if id and id > 0 and id ~= cur then ServerEquippedSlotID[2] = id end
+                                if id and id > 0 and id ~= ActiveAppearance[2].itemID then ServerEquippedSlotID[2] = id end
                             end
                         end)
                         PatchServerFaceAndHairInRAMOnce()
                     end
                 end
                 -- Fast exit if neither pawn nor appearance changed!
-                -- FIX: nil-safe read of ActiveAppearance.
-                local a1 = ActiveAppearance[1] and ActiveAppearance[1].itemID
-                local a2 = ActiveAppearance[2] and ActiveAppearance[2].itemID
-                if not forceUpdate and not a1 and not a2 then
+                if not forceUpdate and not ActiveAppearance[1].itemID and not ActiveAppearance[2].itemID then
                     return
                 end
             else
@@ -15382,28 +15199,9 @@ end
 
 -- 1.lua's own t=2.5s timer will still fire; it now hits OUR LoadLobbyState
 -- (global lookup at call time), so the flag is honored.
--- FIX: a transition is only "settled" when we are in the lobby AND the local
---      character's avatar component is alive. IsInLobbyOrMainCity() alone is
---      true while the result screen is still up, and tryLoad() then called
---      PutOnCustomEquipmentByID on a component being destroyed -- the crash on
---      the way back to the lobby.
-local function LobbyIsSettled()
-    local gs = _G.GameStatus
-    if not (gs and gs.IsInLobbyOrMainCity) then return false end
-    local ok, inLob = pcall(gs.IsInLobbyOrMainCity)
-    if not ok or not inLob then return false end
-    local gd = package.loaded["GameLua.GameCore.Data.GameplayData"]
-    local char = gd and gd.GetPlayerCharacter and gd.GetPlayerCharacter()
-    if not (char and slua.isValid(char)) then return false end
-    local comp = nil
-    pcall(function() comp = char.CharacterAvatarComponent_BP end)
-    return comp ~= nil and slua.isValid(comp)
-end
-
 for _, t in ipairs({ 3.0, 5.0, 8.0, 12.0, 18.0, 26.0, 36.0 }) do
     ticker.AddTimerOnce(t, function()
         if cacheHasData() then return end
-        if not LobbyIsSettled() then return end
         pcall(tryLoad)
     end)
 end
@@ -15420,7 +15218,6 @@ if ticker.AddTimerLoop then
             if not inLobby then return end
             if cacheHasData() then return end
             if count(readDisk()) == 0 then return end
-            if not LobbyIsSettled() then return end   -- FIX: also require a live avatar component
             log("safety net: cache empty, disk populated → reload")
             pcall(tryLoad)
         end)
@@ -16170,16 +15967,9 @@ do
     installMatchHooks()
 
     -- Dedicated timer that survives Lobby -> Match transitions
-    -- FIX (lag): this used to register BOTH a Game 0.4s timer and a ticker 0.4s
-    --      loop running the same tick, so applyBagAndHelmetInMatch did double
-    --      work every 0.4s. Only one loop is created now, and the hook
-    --      re-install is skipped once the hooks are known to be in place.
     local function startBagHelmLoop()
         local function tick()
-            if not _G._BH_HooksReady then
-                pcall(installLobbyHooks)
-                _G._BH_HooksReady = true
-            end
+            pcall(installLobbyHooks)
             pcall(function()
                 local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
                         or require("GameLua.GameCore.Data.GameplayData")
@@ -16192,23 +15982,17 @@ do
             end)
         end
 
-        -- FIX: single instance, ticker preferred, Game timer only as fallback.
-        if _G._BH_TickerLoop or _G._BH_GameTimer then return end
-        local created = false
         pcall(function()
-            local tk = require("common.time_ticker")
-            if tk and tk.AddTimerLoop then
-                _G._BH_TickerLoop = tk.AddTimerLoop(0.4, tick, -1, 0.4)
-                created = true
+            if Game and Game.SetTimer and not _G._BH_GameTimer then
+                _G._BH_GameTimer = Game:SetTimer(0.4, true, tick)
             end
         end)
-        if not created then
-            pcall(function()
-                if Game and Game.SetTimer then
-                    _G._BH_GameTimer = Game:SetTimer(0.4, true, tick)
-                end
-            end)
-        end
+        pcall(function()
+            local tk = require("common.time_ticker")
+            if tk and tk.AddTimerLoop and not _G._BH_TickerLoop then
+                _G._BH_TickerLoop = tk.AddTimerLoop(0.4, tick, -1, 0.4)
+            end
+        end)
     end
     startBagHelmLoop()
 end
@@ -16236,18 +16020,6 @@ local __five_ok, __five_err = pcall(function()
         _G.__STABILITY_COMBINED_V1 = true
         _G.__STABILITY_ENGINE_V1   = true   -- block standalone stability.lua
         _G.__PERF_MODE_V1          = true   -- block standalone perf_mode.lua
-
-        -- PERF-FIX: adaptive stability engine disabled.
-        -- It capped FPS (45/60/88), rewrote r.ScreenPercentage every 300 ms
-        -- and ran a 250 ms ticker -- the main source of in-game lag. Native
-        -- game settings now own FPS/resolution. Keep the guard flags above so
-        -- standalone copies stay blocked, then return without any timer.
-        _G.StabilityCombined = _G.StabilityCombined or {
-            tier = "mid", tierSource = "disabled",
-            stab = { enabled = false, touchRelief = false, thermalGuard = false },
-            perf = { enabled = false, adaptive = false, forceAggressive = false },
-        }
-        do return _G.StabilityCombined end
 
         local BASE = "/storage/emulated/0/Android/data/com.pubg.imobile/files/"
         local LOG  = BASE .. "stability.txt"
@@ -17028,34 +16800,20 @@ return __combined_1_result
 -- ============================================================================
 __defer_feature('2.lua', [===[
 -- ============================================================================
--- VIP PRO EDITION V6.1 — EXACT V6 ENGINE + ALL AIMBOT SLIDERS + GREEN/RED CHAMS
--- Changes from V6:
---   1. Restored 100% of Aimbot toggles & sliders (Hipfire, Shotgun, Scope,
---      Sniper, Mortar + Mortar Trajectory Math + SuperBullet restore logic)
---   2. Chams Color Updated: Real Player Open = Green | Cover = Red | Bot = White
---   3. All V6 Multi-Match Persistence, Native UMG Name/HP/Dist & Snaplines intact
+-- VIP PRO EDITION V6 — MULTI-MATCH PERSISTENT STANDALONE ENGINE
+-- Fixes:
+--   1. Multi-Match Watchdog: Never dies after 1 match; auto-resets on new match
+--   2. Native UMG Overhead Tag: Guaranteed Name, Distance & Health Bar display
+--   3. Full-Body Chams (Slots 0-7 + Weapon + Highlight): Fixes "only head visible"
+--   4. Smooth 30 FPS Snaplines + Top Center Threat Banner + Aimbot V2 + SuperBullet
 -- ============================================================================
 
 -- Clean up any previous version timers if re-executed
--- FIX: nil the handle after clearing, otherwise the old watchdog keeps running
---      and its handle is lost the moment the new one overwrites the global.
-if _G._V6WatchdogHandle then
-    if Game and Game.ClearTimer then
-        pcall(function() Game:ClearTimer(_G._V6WatchdogHandle) end)
-    end
-    _G._V6WatchdogHandle = nil
+if _G._V6WatchdogHandle and Game and Game.ClearTimer then
+    pcall(function() Game:ClearTimer(_G._V6WatchdogHandle) end)
 end
--- FIX: _V6FastReset is the PREVIOUS chunk's closure. It closes over the dead
---      match's ESPEngine and would destroy already-destroyed widgets. Only run
---      it when that engine still owns a valid canvas, then forget the closure.
 if _G._V6FastReset and type(_G._V6FastReset) == "function" then
-    pcall(function()
-        local E = _G.ESPEngine
-        if E and E.Canvas and slua.isValid(E.Canvas) then
-            _G._V6FastReset()
-        end
-    end)
-    _G._V6FastReset = nil
+    pcall(_G._V6FastReset)
 end
 
 -- ============================================================================
@@ -17070,9 +16828,9 @@ local FakeTextMap = {
     [991011] = "   Ignore Knocked",
     [991012] = "   Ignore Bots",
     [991013] = "   VisCheck",
-    [991014] = "   Priority",
-    [991015] = "   Target Bone",
-    [991016] = "   Trigger Mode",
+    [991014] = "   Priority (1=FOV, 2=Dist, 3=HP)",
+    [991015] = "   Target Bone (1=Head, 2=Chest)",
+    [991016] = "   Trigger (1=Fire, 2=Always)",
     [991017] = "   Speed / Smoothness",
     [991018] = "   FOV Radius",
     [991019] = "   Distance Limit",
@@ -17123,11 +16881,11 @@ local FakeTextMap = {
     [992001] = "Enable Player ESP",
     [992002] = "   Show Snaplines",
     [992003] = "   Show Top Radar Banner",
-    [992004] = "   Wallhack Chams (G/R)",
+    [992004] = "   Wallhack Chams (W/G/P)",
     [992005] = "   Show Player Name",
     [992006] = "   Show Distance",
     [992007] = "   Show Health Bar",
-    [992010] = "   Snapline Thickness (1-10)",
+    [992010] = "   Snapline Thickness (1-5)",
     [992012] = "   ESP Type 5 (Enemy Frame)"
 }
 
@@ -17240,7 +16998,7 @@ if not _G._V6PresetsApplied then
     D.AimTouchMortarFOV  = 360; D.AimTouchMortarPred = 0
 end
 
-if _G.Mod_ESP_Enabled         == nil then _G.Mod_ESP_Enabled         = false end
+if _G.Mod_ESP_Enabled         == nil then _G.Mod_ESP_Enabled         = true end
 if _G.Mod_ESP_ShowPlayerCount == nil then _G.Mod_ESP_ShowPlayerCount = true end
 if _G.Mod_ESP_ShowName        == nil then _G.Mod_ESP_ShowName        = true end
 if _G.Mod_ESP_ShowDistance    == nil then _G.Mod_ESP_ShowDistance    = true end
@@ -17277,10 +17035,10 @@ local PALETTE = {
     LineCoverReal = FLinearColor(0.75, 0.10, 1.00, 0.85),
     LineBot       = FLinearColor(0.95, 0.98, 1.00, 0.80),
 
-    -- Chams Colors (Bot = White | Real Open = Green | Real Cover = Red)
+    -- Chams Colors (Bot = White Always | Real Open = Green | Real Cover = Purple)
     ChamBotWhite  = FLinearColor(255, 255, 255, 110),
-    ChamRealOpen  = FLinearColor(0,   255, 0,   110), -- Green in Open
-    ChamRealCover = FLinearColor(255, 0,   0,   110), -- Red in Cover
+    ChamRealOpen  = FLinearColor(0,   255, 40,  110),
+    ChamRealCover = FLinearColor(185, 0,   255, 110),
 
     -- Overhead Tag & Banner Text SlateColors
     TextDanger    = MakeSlateCol(1.00, 0.28, 0.32, 1.0),
@@ -17375,7 +17133,7 @@ local function SyncEnemyRoster(myPlayer)
 end
 
 -- ============================================================================
--- PART 6: AIMBOT V2 ENGINE (WITH MORTAR TRAJECTORY) + SHOTGUN SUPER BULLET
+-- PART 6: AIMBOT V2 ENGINE + SHOTGUN SUPER BULLET
 -- ============================================================================
 local lastAimTime = 0
 local AIM_INTERVAL = 0.025
@@ -17411,7 +17169,7 @@ local function AimTouch()
                 local wID   = type(weapon.GetWeaponID) == "function" and weapon:GetWeaponID() or 0
                 local wName = type(weapon.GetWeaponName) == "function" and weapon:GetWeaponName() or ""
                 local wLow  = wName:lower()
-                local sg = (wID >= 1040000 and wID < 1050000) or (wID >= 1030000 and wID < 1040000 and (wLow:find("s686") or wLow:find("s1897") or wLow:find("s12") or wLow:find("dbs") or wLow:find("m1014"))) or wLow:find("s686") or wLow:find("s1897") or wLow:find("s12") or wLow:find("dbs") or wLow:find("m1014") or wLow:find("ns2000")
+                local sg = (wID >= 1040000 and wID < 1050000) or wLow:find("s686") or wLow:find("s1897") or wLow:find("s12") or wLow:find("dbs") or wLow:find("m1014") or wLow:find("ns2000")
                 local sn = wLow:find("kar98") or wLow:find("m24") or wLow:find("awm") or wLow:find("mosin") or wLow:find("win94") or wLow:find("amr") or wLow:find("sks") or wLow:find("slr") or wLow:find("mini") or wLow:find("mk14") or wLow:find("qbu") or wLow:find("mk12") or wLow:find("vss")
                 local mo = wLow:find("mortar")
                 weapon._V6WepType = (mo and 3) or (sg and 1) or (sn and 2) or 0
@@ -17423,24 +17181,19 @@ local function AimTouch()
 
             if isShotgun then
                 if type(weapon.GetCurrentAmmo) == "function" then currentAmmo = weapon:GetCurrentAmmo() or 1
-                elseif weapon.ShootWeaponComponent and type(weapon.ShootWeaponComponent.GetCurrentAmmo) == "function" then currentAmmo = weapon.ShootWeaponComponent:GetCurrentAmmo() or 1
                 elseif weapon.CurrentAmmo ~= nil then currentAmmo = weapon.CurrentAmmo end
             end
 
             -- Super Bullet
             if C.SuperBulletSG and isShotgun then
-                local candidates = { weapon.ShootWeaponEntityComp, weapon.ShootWeaponEntity, weapon.ShootWeaponEntity_GEN_VARIABLE, weapon.ShootWeaponComponent }
+                local candidates = { weapon.ShootWeaponEntityComp, weapon.ShootWeaponEntity, weapon.ShootWeaponComponent }
                 local n = C.SuperBulletSGCount or 20
                 for _, se in ipairs(candidates) do
                     if Valid(se) and se._AppliedSB ~= n then
-                        if not se._OrigBulletNum then
-                            pcall(function() se._OrigBulletNum = se.BulletNumSingleShot or 1 end)
-                        end
+                        if not se._OrigBulletNum then se._OrigBulletNum = se.BulletNumSingleShot or 9 end
                         pcall(function() se.BulletNumSingleShot = n end)
                         pcall(function() se.BulletNum = n end)
                         pcall(function() se.PelletCount = n end)
-                        pcall(function() se.ExtraHitPerformScale = n end)
-                        pcall(function() se.HitScanRange = 999999 end)
                         se._AppliedSB = n
                     end
                 end
@@ -17464,9 +17217,7 @@ local function AimTouch()
         local predVal, recoilCompVal = 0, 0
 
         if isMortar and C.AimTouchMortar then
-            local isPlaced = false
-            pcall(function() if weapon and weapon.MortarState == 2 then isPlaced = true end end)
-            if not isPlaced then return end
+            if not (weapon and weapon.MortarState == 2) then return end
             cond = 2; prioMode = 1; boneIdx = 4; speedVal = 100; fovVal = D.AimTouchMortarFOV or 360; maxDistMeters = 2000; predVal = D.AimTouchMortarPred or 0
         elseif isShotgun and C.AimTouchSG then
             cond = D.AimTouchSGCond or 1; if C.AimTouchSGAutoFire then cond = 2 end
@@ -17531,12 +17282,9 @@ local function AimTouch()
                     if not skip then
                         local tPos = target:GetBonePos(selBoneName, _ZeroVec3)
                         if not tPos or (tPos.X == 0 and tPos.Y == 0 and tPos.Z == 0) then
-                            if type(target.GetSocketLocation) == "function" then tPos = target:GetSocketLocation(selBoneName) end
-                        end
-                        if not tPos or (tPos.X == 0 and tPos.Y == 0 and tPos.Z == 0) then
                             if type(target.K2_GetActorLocation) == "function" then
                                 tPos = target:K2_GetActorLocation()
-                                if tPos then tPos.Z = tPos.Z + ((boneIdx == 1 and 70) or (boneIdx == 2 and 40) or (boneIdx == 3 and 20) or 0) end
+                                if tPos then tPos.Z = tPos.Z + ((boneIdx == 1 and 70) or (boneIdx == 2 and 40) or 20) end
                             end
                         end
 
@@ -17625,42 +17373,6 @@ local function AimTouch()
             finalPitch = finalPitch - ((recoilCompVal * 0.02) * 1.5)
         end
 
-        -- Mortar Aimbot Trajectory Calculation
-        if isMortar and C.AimTouchMortar then
-            local targetPos = { X = finalBonePos.X, Y = finalBonePos.Y, Z = finalBonePos.Z }
-            local launchPos = camLoc
-            pcall(function()
-                if player.K2_GetActorLocation then
-                    local pLoc = player:K2_GetActorLocation()
-                    if pLoc then launchPos = { X = pLoc.X, Y = pLoc.Y, Z = pLoc.Z + 50 } end
-                end
-            end)
-            local function CalcTraj(V, G_, tX, tY, tZ)
-                local mDx = math.sqrt((tX - launchPos.X)^2 + (tY - launchPos.Y)^2) - 80
-                if mDx < 500 then mDx = 500 end
-                local mDy = tZ - launchPos.Z
-                local minVSq = G_ * (mDy + math.sqrt(mDx*mDx + mDy*mDy))
-                if (V*V) < minVSq then V = math.sqrt(minVSq) + 100 end
-                local v2 = V*V
-                local root = v2*v2 - G_*(G_*mDx*mDx + 2*mDy*v2)
-                if root >= 0 then
-                    local aRad = math.atan((v2 + math.sqrt(root)) / (G_ * mDx))
-                    local deg = math.deg(aRad)
-                    if deg >= 35 and deg <= 89.5 then return true, deg end
-                end
-                return false, 45
-            end
-            local physAngle = 45
-            local okN, angN = CalcTraj(9070, 980*2.8, targetPos.X, targetPos.Y, targetPos.Z)
-            local okF, angF = CalcTraj(12520, 980*4.0, targetPos.X, targetPos.Y, targetPos.Z)
-            local okU, angU = CalcTraj(16800, 980*4.5, targetPos.X, targetPos.Y, targetPos.Z)
-            if okN then physAngle = angN elseif okF then physAngle = angF elseif okU then physAngle = angU end
-            local tCamPitch = ((physAngle - 45) / 43.0) * 90.0 - 60.0
-            local dP = tCamPitch - curRot.Pitch
-            if dP > 180 then dP = dP - 360 elseif dP < -180 then dP = dP + 360 end
-            finalPitch = curRot.Pitch + (dP * smoothFactor)
-        end
-
         _AimRotOut.Pitch = finalPitch
         _AimRotOut.Yaw   = finalYaw
         _AimRotOut.Roll  = 0
@@ -17682,48 +17394,6 @@ local function AimTouch()
 end
 
 -- ============================================================================
--- PASS-2 CRASH HELPERS
--- ============================================================================
--- FIX (pass 2): one place that tears a UMG widget down in the only order that
--- is safe. RemoveFromParent() MUST succeed before ConditionalBeginDestroy():
--- destroying a widget that is still parented makes Slate free the object while
--- its parent panel still holds the pointer, and the panel frees it again when
--- the HUD is torn down. That second free is a native access violation -- pcall
--- cannot catch it, which is exactly why the crash survived pass 1.
-if not _G._DetachThenDestroy then
-    function _G._DetachThenDestroy(w)
-        if w == nil then return false end
-        if not _G.SafeValid(w) then return false end
-        local ok = pcall(function() w:RemoveFromParent() end)
-        if not ok then
-            -- Still parented: its owner is responsible for it. Dropping our
-            -- reference is the only safe move.
-            return false
-        end
-        pcall(function() w:ConditionalBeginDestroy() end)
-        return true
-    end
-end
-
--- FIX (pass 2): true only while a real match level is running. Used to stop
--- the ESP engine from building widgets in the lobby, where the canvas it
--- attaches to is the lobby HUD that the game destroys on match load.
-if not _G._InMatchNow then
-    function _G._InMatchNow()
-        local gs = _G.GameStatus
-        if not gs then return true end
-        if type(gs.IsInFightingStatus) == "function" then
-            local ok, r = pcall(gs.IsInFightingStatus)
-            if ok and r == false then return false end
-        end
-        if type(gs.IsInLobbyOrMainCity) == "function" then
-            local ok, r = pcall(gs.IsInLobbyOrMainCity)
-            if ok and r == true then return false end
-        end
-        return true
-    end
-end
-
 -- PART 7: PURE UMG OVERHEAD TAG + BANNER + SNAPLINES + FULL-BODY CHAMS
 -- ============================================================================
 local ESPEngine = {
@@ -17756,71 +17426,21 @@ local ESPEngine = {
     }
 }
 
--- FIX (pass 2): ESPEngine used to be a file-local, so the re-entry guard in
--- 2.lua (`if _G.ESPEngine then _G.ESPEngine = nil ... end`) always saw nil and
--- silently skipped the reset. Every match therefore leaked a full set of
--- widgets onto a canvas that the game was about to destroy.
-_G.ESPEngine = ESPEngine
-
 -- Full Reset when transitioning between matches
--- FIX: destroys one ESP node's widgets exactly once, then drops every
---      reference so nothing can be double-destroyed later.
-local function _DestroyESPNode(node)
-    if not node then return end
-    -- FIX (pass 2): the old code ran RemoveFromParent() and
-    -- ConditionalBeginDestroy() inside ONE pcall. If the detach threw (which it
-    -- does the moment the owning HUD is already gone) the destroy was skipped
-    -- and the widget stayed parented; if the detach half-succeeded the destroy
-    -- ran on a still-parented widget. Both paths end in a double free inside
-    -- Slate. _DetachThenDestroy() only destroys after a confirmed detach.
-    if node.Overhead then
-        _DetachThenDestroy(node.Overhead.Container)
-        node.Overhead.Container = nil
-        node.Overhead.Slot      = nil
-    end
-    if node.Snapline then
-        _DetachThenDestroy(node.Snapline.Widget)
-        node.Snapline.Widget = nil
-    end
-    node.Overhead = nil
-    node.Snapline = nil
-    node.Pawn     = nil
-end
-
--- FIX: clears every ESP node without mutating the table during pairs().
---      The old code did ESPEngine.Nodes[k] = nil inside pairs(), which throws
---      "invalid key to 'next'" as soon as more than one enemy is tracked --
---      i.e. exactly at match end. That aborted the reset halfway and left a
---      live canvas whose owner widget the game had already destroyed.
-local function _ClearAllESPNode()
-    local keys = {}
-    for k in pairs(ESPEngine.Nodes) do keys[#keys + 1] = k end
-    for i = 1, #keys do
-        _DestroyESPNode(ESPEngine.Nodes[keys[i]])
-        ESPEngine.Nodes[keys[i]] = nil
-    end
-end
-
 local function ResetESPEngineForNewMatch()
-    _ClearAllESPNode()
-
-    local B = ESPEngine.Banner
-    -- FIX (pass 2): park the slot off-screen first. The banner slot lives in
-    -- the canvas' slot array; while it still points at a visible position the
-    -- canvas keeps laying it out every frame, and layout on a half-destroyed
-    -- child is another native crash path.
-    if Valid(B.Slot) then
-        pcall(function() B.Slot:SetPosition(FVector2D(-10000, -10000)) end)
-        pcall(function() B.Slot:SetVisibility(UEnums.ESlateVisibility.Collapsed) end)
+    for k, node in pairs(ESPEngine.Nodes) do
+        if node.Overhead and Valid(node.Overhead.Container) then
+            pcall(function() node.Overhead.Container:RemoveFromParent(); node.Overhead.Container:ConditionalBeginDestroy() end)
+        end
+        if node.Snapline and Valid(node.Snapline.Widget) then
+            pcall(function() node.Snapline.Widget:RemoveFromParent(); node.Snapline.Widget:ConditionalBeginDestroy() end)
+        end
+        ESPEngine.Nodes[k] = nil
     end
-    -- Children of the container are destroyed with it; they are only detached
-    -- here so the container's own teardown cannot walk a dangling child list.
-    if Valid(B.TextBlock) then pcall(function() B.TextBlock:RemoveFromParent() end) end
-    if Valid(B.AccentBar) then pcall(function() B.AccentBar:RemoveFromParent() end) end
-    -- FIX (pass 2): safe detach-then-destroy. If the detach fails the widget is
-    -- still owned by a live panel, so it is left alone instead of double-freed.
-    _DetachThenDestroy(B.Container)
-
+    local B = ESPEngine.Banner
+    if Valid(B.Container) then
+        pcall(function() B.Container:RemoveFromParent(); B.Container:ConditionalBeginDestroy() end)
+    end
     B.Container = nil
     B.Slot = nil
     B.TextBlock = nil
@@ -17828,30 +17448,16 @@ local function ResetESPEngineForNewMatch()
     B.LastText = ""
     B.LastState = -1
     B.LastX = -9999
-    B.LastY = -9999
     ESPEngine.Canvas = nil
     ESPEngine.LastTransformTime = 0
     ESPEngine.Chams.ConsoleReady = false
-    -- FIX: clear identity here too, otherwise the next tick resets a second time.
-    ESPEngine.LastPC = nil
-    ESPEngine.LastPawn = nil
     EnemyRoster.LastSync = 0
     aimVisCache = {}
 end
 _G._V6FastReset = ResetESPEngineForNewMatch
 
 local function EnsureCanvas()
-    -- FIX (pass 2): never build ESP widgets outside a live match. In the lobby
-    -- the only canvas available is the game's own HUD canvas, which the game
-    -- destroys when the match level loads -- taking our widgets with it and
-    -- leaving every cached reference pointing into freed Slate memory.
-    if not _InMatchNow() then
-        if ESPEngine.Canvas ~= nil or next(ESPEngine.Nodes) ~= nil then
-            ResetESPEngineForNewMatch()
-        end
-        return false
-    end
-
+    if Valid(ESPEngine.Canvas) then return true end
     local InGameUITools = package.loaded["GameLua.Mod.BaseMod.Common.UI.InGameUITools"]
     if not InGameUITools then pcall(function() InGameUITools = require("GameLua.Mod.BaseMod.Common.UI.InGameUITools") end) end
     if not InGameUITools or not InGameUITools.GetMainControlBaseUI then return false end
@@ -17860,22 +17466,9 @@ local function EnsureCanvas()
     if not Valid(MainUI) then return false end
     local c = (Valid(MainUI.CanvasPanel_0) and MainUI.CanvasPanel_0) or (Valid(MainUI.CanvasPanel_42) and MainUI.CanvasPanel_42) or nil
     if not c then return false end
-
-    -- FIX (pass 2): identity check, not just validity. slua.isValid() can still
-    -- report true for a widget the game has already queued for destruction, so
-    -- the old `if Valid(ESPEngine.Canvas) then return true end` happily reused
-    -- the dead lobby canvas. Comparing against the canvas the HUD exposes right
-    -- now catches the swap: if it changed, everything bound to the old one is
-    -- torn down before the new one is adopted.
-    if ESPEngine.Canvas ~= c then
-        if ESPEngine.Canvas ~= nil then
-            ResetESPEngineForNewMatch()
-        end
-        ESPEngine.Canvas = c
-        ESPEngine.LastTransformTime = 0
-        ESPEngine.Banner.LastX = -9999
-        ESPEngine.Banner.LastY = -9999
-    end
+    ESPEngine.Canvas = c
+    ESPEngine.LastTransformTime = 0
+    ESPEngine.Banner.LastX = -9999
     return true
 end
 
@@ -18047,6 +17640,7 @@ end
 
 -- ============================================================================
 -- PURE NATIVE UMG OVERHEAD WIDGET (100% RELIABLE NAME + DISTANCE + HP BAR)
+-- Does not rely on OB_PlayerHeadHPItem_UIBP so it NEVER fails to show!
 -- ============================================================================
 local HP_BAR_WIDTH  = 68
 local HP_BAR_HEIGHT = 4
@@ -18066,7 +17660,7 @@ local function CreatePureOverheadWidget()
         if mainSlot then
             mainSlot:SetAutoSize(false)
             mainSlot:SetSize(FVector2D(TAG_WIDTH, TAG_HEIGHT))
-            mainSlot:SetAlignment(FVector2D(0.5, 1.0))
+            mainSlot:SetAlignment(FVector2D(0.5, 1.0)) -- Bottom-center anchored right above head
             mainSlot:SetZOrder(25)
         end
 
@@ -18174,7 +17768,8 @@ local function CreateSnaplineWidget()
 end
 
 -- ============================================================================
--- FULL-BODY CHAMS APPLICATOR (OPEN = GREEN | COVER = RED | BOT = WHITE)
+-- FULL-BODY CHAMS APPLICATOR (ALL 8 AVATAR SLOTS + WEAPON + HIGHLIGHT)
+-- Fixes "only head visible" by styling all streamed outfit slots + highlight!
 -- ============================================================================
 local function ApplyMeshChamsFull(mesh, visCol, occCol)
     if not Valid(mesh) then return end
@@ -18214,21 +17809,9 @@ local function RealTimeESPTick()
     if now - lastESPRender < ESP_RENDER_INTERVAL then return end
     lastESPRender = now
 
-    -- FIX (pass 2, ROOT CAUSE): hard gate on match state. Between matches this
-    -- tick used to keep running against the lobby HUD canvas while the engine
-    -- was tearing that HUD down. Every AddChildToCanvas / SetPosition on those
-    -- widgets after teardown is a native access violation. Bail out and release
-    -- everything the moment we are no longer in a match.
-    if not _InMatchNow() then
-        if ESPEngine.Canvas ~= nil or next(ESPEngine.Nodes) ~= nil
-           or ESPEngine.Banner.Container ~= nil then
-            ResetESPEngineForNewMatch()
-        end
-        return
-    end
-
     local myPlayer, pc = GetLocalPlayerAndPC()
     if not Valid(myPlayer) or not Valid(pc) then
+        -- We are in lobby or loading screen: clean up old match state
         if ESPEngine.LastPC ~= nil then
             ESPEngine.LastPC = nil
             ESPEngine.LastPawn = nil
@@ -18237,21 +17820,11 @@ local function RealTimeESPTick()
         return
     end
 
-    -- FIX: full teardown only on a real PC change (the actual match boundary).
-    --      The old test also fired on every pawn change -- respawn, spectate and
-    --      the waiting island -- which destroyed and rebuilt the whole canvas
-    --      while the game was tearing it down, causing a double
-    --      ConditionalBeginDestroy() inside Slate.
-    if ESPEngine.LastPC ~= pc then
+    -- Detect Match Change / Respawn and auto-reset cleanly!
+    if ESPEngine.LastPC ~= pc or ESPEngine.LastPawn ~= myPlayer then
         ESPEngine.LastPC = pc
         ESPEngine.LastPawn = myPlayer
         ResetESPEngineForNewMatch()
-    elseif ESPEngine.LastPawn ~= myPlayer then
-        -- Same match, new pawn: keep the canvas, drop only the per-pawn nodes.
-        ESPEngine.LastPawn = myPlayer
-        _ClearAllESPNode()
-        EnemyRoster.LastSync = 0
-        aimVisCache = {}
     end
 
     if not _G.Mod_ESP_Enabled then
@@ -18265,6 +17838,7 @@ local function RealTimeESPTick()
         if not EnsureCanvas() then return end
         UpdateCanvasMetrics(pc, now)
 
+        -- Console Setup for Chams (Re-runs automatically at start of every match)
         if _G.Mod_ESP_Wallhack and not ESPEngine.Chams.ConsoleReady then
             local KSL = import("KismetSystemLibrary")
             local world = slua.getWorld()
@@ -18338,6 +17912,7 @@ local function RealTimeESPTick()
                         ESPEngine.Nodes[key] = node
                     end
 
+                    -- Retry name lookup if real player name hadn't replicated on spawn frame
                     if not node.bIsAI and (node.Name == "Player" or node.Name == "Enemy" or node.Name == "Unknown") then
                         pcall(function()
                             local n = (pawn.GetPlayerNameSafety and pawn:GetPlayerNameSafety())
@@ -18348,7 +17923,8 @@ local function RealTimeESPTick()
 
                     if node.bIsAI then botCount = botCount + 1 else realCount = realCount + 1 end
 
-                    -- 1. Full-Body Chams (Bot = White, Real Open = Green, Real Cover = Red)
+                    -- 1. Full-Body Chams (Bot = White, Real Open = Green, Real Cover = Purple)
+                    -- Re-applies every 1.5s so newly streamed clothing/helmet/vest slots (0..7) get coloured!
                     if showWH and (now - node.ChamsTime) > 1.5 then
                         node.ChamsTime = now
                         local visCol = node.bIsAI and PALETTE.ChamBotWhite or PALETTE.ChamRealOpen
@@ -18551,23 +18127,19 @@ local function RealTimeESPTick()
         end
 
         -- Clean up dead or despawned enemies
-        -- FIX: collect first, delete after. Mutating during pairs() threw
-        --      "invalid key to 'next'" every time the whole enemy list
-        --      despawned at match end, aborting the tick halfway through.
-        local deadKeys = {}
-        for k in pairs(ESPEngine.Nodes) do
-            if not activeKeys[k] then deadKeys[#deadKeys + 1] = k end
-        end
-        for i = 1, #deadKeys do
-            local k = deadKeys[i]
-            local node = ESPEngine.Nodes[k]
-            if node then
+        for k, node in pairs(ESPEngine.Nodes) do
+            if not activeKeys[k] then
                 if node.ESP5Applied and Valid(node.Pawn) and node.Pawn.Replay_SetVisiableOfFrameUI then
                     pcall(function() node.Pawn:Replay_SetVisiableOfFrameUI(false) end)
                 end
-                _DestroyESPNode(node)
+                if node.Overhead and Valid(node.Overhead.Container) then
+                    pcall(function() node.Overhead.Container:RemoveFromParent(); node.Overhead.Container:ConditionalBeginDestroy() end)
+                end
+                if node.Snapline and Valid(node.Snapline.Widget) then
+                    pcall(function() node.Snapline.Widget:RemoveFromParent(); node.Snapline.Widget:ConditionalBeginDestroy() end)
+                end
+                ESPEngine.Nodes[k] = nil
             end
-            ESPEngine.Nodes[k] = nil
         end
 
         UpdateBanner(realCount, botCount, nearestMeters == 9999 and 0 or nearestMeters, _G.Mod_ESP_ShowPlayerCount)
@@ -18576,115 +18148,47 @@ end
 
 -- ============================================================================
 -- PART 8: IMMORTAL MULTI-MATCH SCHEDULER (NEVER DIES AFTER MATCH 1!)
+-- Uses BOTH time_ticker AND Game:SetTimer + PC:AddGameTimer fallback
 -- ============================================================================
 local _AttachedTimerPC = nil
-local _AttachedTimerId = nil    -- FIX: keep the handle so it can be removed
-local _TickerRunning   = false  -- FIX: single-instance guard
 
 local function MasterFrameTick()
-    -- FIX: bail out while the world is being torn down. pcall cannot catch a
-    --      freed-object access, so the guard has to come first.
-    local myPlayer, pc = GetLocalPlayerAndPC()
-    if not Valid(pc) or not Valid(myPlayer) then return end
     pcall(AimTouch)
     pcall(RealTimeESPTick)
 end
 
+-- 1. Self-healing time_ticker loop
 local _lastTickerHeartbeat = 0
 local function StartTickerLoop()
-    -- FIX: without this guard every stalled match transition spawned another
-    --      self-rescheduling 40 Hz chain. After 2-4 matches N chains were all
-    --      building ESP widgets -- the main crash + lag source.
-    if _TickerRunning then return end
     local t = nil
     pcall(function() t = require("common.time_ticker") end)
-    if not (t and t.AddTimerOnce) then return end
-    _TickerRunning = true
-    local function step()
-        _lastTickerHeartbeat = os.clock()
-        MasterFrameTick()
-        if not _TickerRunning then return end
+    if t and t.AddTimerOnce then
+        local function step()
+            _lastTickerHeartbeat = os.clock()
+            MasterFrameTick()
+            pcall(t.AddTimerOnce, 0.025, step)
+        end
         pcall(t.AddTimerOnce, 0.025, step)
     end
-    pcall(t.AddTimerOnce, 0.025, step)
 end
 StartTickerLoop()
 
--- FIX (pass 2): common.time_ticker is shared by ~28 looping registrations in
--- this bundle. A single unguarded error inside one callback propagates into the
--- engine's timer pump, which aborts the pump mid-frame and leaves the UI half
--- torn down -- the next transition then walks that broken state and crashes.
--- Wrapping each callback keeps the pump alive and records the error instead.
-function _G.__HardenTicker()
-    local ok, tk = pcall(require, "common.time_ticker")
-    if not ok or type(tk) ~= "table" then return false end
-    if tk.__hardened then return true end
-
-    local function wrap(fn)
-        if type(fn) ~= "function" then return fn end
-        return function(...)
-            local okc, r = pcall(fn, ...)
-            if not okc then
-                _G.__last_timer_error = tostring(r)
-                return nil
-            end
-            return r
-        end
-    end
-
-    local origLoop = tk.AddTimerLoop
-    local origOnce = tk.AddTimerOnce
-    if type(origLoop) == "function" then
-        tk.AddTimerLoop = function(interval, fn, ...)
-            return origLoop(interval, wrap(fn), ...)
-        end
-    end
-    if type(origOnce) == "function" then
-        tk.AddTimerOnce = function(delay, fn, ...)
-            return origOnce(delay, wrap(fn), ...)
-        end
-    end
-    tk.__hardened = true
-    return true
-end
-pcall(_G.__HardenTicker)
-
+-- 2. Immortal 1-Second Watchdog: Re-starts ticker or attaches to new Match PC if cleared between matches!
 local function MultiMatchWatchdog()
     pcall(function()
-        -- FIX (pass 2): the ticker module may not have been loaded yet when the
-        -- hardening ran above. Retry until it takes.
-        if not (_G.__TickerHardened) then
-            if _G.__HardenTicker() then _G.__TickerHardened = true end
-        end
-
         local now = os.clock()
         if now - _lastTickerHeartbeat > 0.5 then
             StartTickerLoop()
         end
 
         local _, pc = GetLocalPlayerAndPC()
-
-        -- FIX: when the PC we attached to is destroyed, drop the reference AND
-        --      remove its game timer. Previously the dead PC was kept forever
-        --      and its AddGameTimer closure kept firing on a freed controller.
-        if _AttachedTimerPC and not Valid(_AttachedTimerPC) then
-            if _AttachedTimerId and _AttachedTimerPC.RemoveGameTimer then
-                pcall(function() _AttachedTimerPC:RemoveGameTimer(_AttachedTimerId) end)
-            end
-            _AttachedTimerPC = nil
-            _AttachedTimerId = nil
-        end
-
         if Valid(pc) and _AttachedTimerPC ~= pc and pc.AddGameTimer then
             _AttachedTimerPC = pc
-            local ok, id = pcall(function()
-                return pc:AddGameTimer(0.030, true, function()
-                    if os.clock() - _lastTickerHeartbeat > 0.15 then
-                        MasterFrameTick()
-                    end
-                end)
+            pc:AddGameTimer(0.030, true, function()
+                if os.clock() - _lastTickerHeartbeat > 0.15 then
+                    MasterFrameTick()
+                end
             end)
-            _AttachedTimerId = ok and id or nil
         end
     end)
 end
@@ -18695,7 +18199,7 @@ end
 MultiMatchWatchdog()
 
 -- ============================================================================
--- PART 9: IN-GAME SETTINGS MENU (ALL AIMBOT SLIDERS RESTORED + ESP)
+-- PART 9: IN-GAME SETTINGS MENU (AIMBOT + ESP ONLY — NO LOOT ESP)
 -- ============================================================================
 function _G.InitMasterMenusV6()
     HookLocUtil()
@@ -18707,105 +18211,48 @@ function _G.InitMasterMenusV6()
 
     local StackAimbot = {
         { Key = "ModMenu_AT_Ex", UI = AM.TitleSwitcher, Text = 991001, ExpandIndex = 0, GetFunc = function() return C.AimTouchEnable end, SetFunc = function(c,v) C.AimTouchEnable = v return true end },
-
-        -- Hipfire Aimbot (All Sliders & Toggles)
         { Key = "ModMenu_AT_Hip_Ex", UI = AM.TitleSwitcher, Text = 991010, ExpandHandle = "ModMenu_AT_Ex", ExpandIndex = 0, GetFunc = function() return C.AimTouchHipfire end, SetFunc = function(c,v) C.AimTouchHipfire = v return true end },
         { Key = "ModMenu_AT_Hip_IgKnock", UI = AM.Switcher, Text = 991011, ExpandHandle = "ModMenu_AT_Hip_Ex", GetFunc = function() return C.AimTouchHipIgKnock end, SetFunc = function(c,v) C.AimTouchHipIgKnock = v return true end },
         { Key = "ModMenu_AT_Hip_IgBot", UI = AM.Switcher, Text = 991012, ExpandHandle = "ModMenu_AT_Hip_Ex", GetFunc = function() return C.AimTouchHipIgBot end, SetFunc = function(c,v) C.AimTouchHipIgBot = v return true end },
         { Key = "ModMenu_AT_Hip_Vis", UI = AM.Switcher, Text = 991013, ExpandHandle = "ModMenu_AT_Hip_Ex", GetFunc = function() return C.AimTouchHipVisCheck end, SetFunc = function(c,v) C.AimTouchHipVisCheck = v return true end },
-        { Key = "ModMenu_AT_Hip_Prio", UI = AM.Slider, Text = 991014, ExpandHandle = "ModMenu_AT_Hip_Ex", MinValue = 1, MaxValue = 4, min = 1, max = 4, Min = 1, Max = 4, GetFunc = function() return D.AimTouchHipPrio or 1 end, SetFunc = function(c,v) local n = math.floor(v+0.5); if n<1 then n=1 end; if n>4 then n=4 end; D.AimTouchHipPrio = n return true end },
-        { Key = "ModMenu_AT_Hip_Bone", UI = AM.Slider, Text = 991015, ExpandHandle = "ModMenu_AT_Hip_Ex", MinValue = 1, MaxValue = 4, min = 1, max = 4, Min = 1, Max = 4, GetFunc = function() return D.AimTouchHipBone or 1 end, SetFunc = function(c,v) local n = math.floor(v+0.5); if n<1 then n=1 end; if n>4 then n=4 end; D.AimTouchHipBone = n return true end },
-        { Key = "ModMenu_AT_Hip_Cond", UI = AM.Slider, Text = 991016, ExpandHandle = "ModMenu_AT_Hip_Ex", MinValue = 1, MaxValue = 2, min = 1, max = 2, Min = 1, Max = 2, GetFunc = function() return D.AimTouchHipCond or 1 end, SetFunc = function(c,v) local n = math.floor(v+0.5); if n<1 then n=1 end; if n>2 then n=2 end; D.AimTouchHipCond = n return true end },
+        { Key = "ModMenu_AT_Hip_Prio", UI = AM.Slider, Text = 991014, ExpandHandle = "ModMenu_AT_Hip_Ex", MinValue = 1, MaxValue = 4, min = 1, max = 4, GetFunc = function() return D.AimTouchHipPrio or 1 end, SetFunc = function(c,v) D.AimTouchHipPrio = math.floor(v+0.5) return true end },
+        { Key = "ModMenu_AT_Hip_Bone", UI = AM.Slider, Text = 991015, ExpandHandle = "ModMenu_AT_Hip_Ex", MinValue = 1, MaxValue = 4, min = 1, max = 4, GetFunc = function() return D.AimTouchHipBone or 1 end, SetFunc = function(c,v) D.AimTouchHipBone = math.floor(v+0.5) return true end },
+        { Key = "ModMenu_AT_Hip_Cond", UI = AM.Slider, Text = 991016, ExpandHandle = "ModMenu_AT_Hip_Ex", MinValue = 1, MaxValue = 2, min = 1, max = 2, GetFunc = function() return D.AimTouchHipCond or 1 end, SetFunc = function(c,v) D.AimTouchHipCond = math.floor(v+0.5) return true end },
         { Key = "ModMenu_AT_Hip_Spd", UI = AM.Slider, Text = 991017, ExpandHandle = "ModMenu_AT_Hip_Ex", MinValue = 1, MaxValue = 100, min = 1, max = 100, GetFunc = function() return D.AimTouchHipSpeed or 75 end, SetFunc = function(c,v) D.AimTouchHipSpeed = v return true end },
         { Key = "ModMenu_AT_Hip_FOV", UI = AM.Slider, Text = 991018, ExpandHandle = "ModMenu_AT_Hip_Ex", MinValue = 1, MaxValue = 100, min = 1, max = 100, GetFunc = function() return D.AimTouchHipFOV or 15 end, SetFunc = function(c,v) D.AimTouchHipFOV = v return true end },
         { Key = "ModMenu_AT_Hip_Dist", UI = AM.Slider, Text = 991019, ExpandHandle = "ModMenu_AT_Hip_Ex", MinValue = 1, MaxValue = 100, min = 1, max = 100, GetFunc = function() return math.floor((D.AimTouchHipDist or 500) / 5) end, SetFunc = function(c,v) D.AimTouchHipDist = v * 5 return true end },
         { Key = "ModMenu_AT_Hip_Recoil", UI = AM.Slider, Text = 991020, ExpandHandle = "ModMenu_AT_Hip_Ex", MinValue = 0, MaxValue = 100, min = 0, max = 100, GetFunc = function() return D.AimTouchHipRecoil or 0 end, SetFunc = function(c,v) D.AimTouchHipRecoil = v return true end },
         { Key = "ModMenu_AT_Hip_Pred", UI = AM.Slider, Text = 991021, ExpandHandle = "ModMenu_AT_Hip_Ex", MinValue = 0, MaxValue = 100, min = 0, max = 100, GetFunc = function() return D.AimTouchHipPred or 0 end, SetFunc = function(c,v) D.AimTouchHipPred = v return true end },
 
-        -- Shotgun Aimbot (All Sliders & Toggles Restored)
         { Key = "ModMenu_AT_SG_Ex", UI = AM.TitleSwitcher, Text = 991030, ExpandHandle = "ModMenu_AT_Ex", ExpandIndex = 0, GetFunc = function() return C.AimTouchSG end, SetFunc = function(c,v) C.AimTouchSG = v return true end },
         { Key = "ModMenu_AT_SG_Auto", UI = AM.Switcher, Text = 991031, ExpandHandle = "ModMenu_AT_SG_Ex", GetFunc = function() return C.AimTouchSGAutoFire end, SetFunc = function(c,v) C.AimTouchSGAutoFire = v return true end },
         { Key = "ModMenu_AT_SG_IgKnock", UI = AM.Switcher, Text = 991032, ExpandHandle = "ModMenu_AT_SG_Ex", GetFunc = function() return C.AimTouchSGIgKnock end, SetFunc = function(c,v) C.AimTouchSGIgKnock = v return true end },
         { Key = "ModMenu_AT_SG_IgBot", UI = AM.Switcher, Text = 991033, ExpandHandle = "ModMenu_AT_SG_Ex", GetFunc = function() return C.AimTouchSGIgBot end, SetFunc = function(c,v) C.AimTouchSGIgBot = v return true end },
         { Key = "ModMenu_AT_SG_Vis", UI = AM.Switcher, Text = 991034, ExpandHandle = "ModMenu_AT_SG_Ex", GetFunc = function() return C.AimTouchSGVisCheck end, SetFunc = function(c,v) C.AimTouchSGVisCheck = v return true end },
-        { Key = "ModMenu_AT_SG_Prio", UI = AM.Slider, Text = 991035, ExpandHandle = "ModMenu_AT_SG_Ex", MinValue = 1, MaxValue = 4, min = 1, max = 4, Min = 1, Max = 4, GetFunc = function() return D.AimTouchSGPrio or 1 end, SetFunc = function(c,v) local n = math.floor(v+0.5); if n<1 then n=1 end; if n>4 then n=4 end; D.AimTouchSGPrio = n return true end },
-        { Key = "ModMenu_AT_SG_Bone", UI = AM.Slider, Text = 991036, ExpandHandle = "ModMenu_AT_SG_Ex", MinValue = 1, MaxValue = 4, min = 1, max = 4, Min = 1, Max = 4, GetFunc = function() return D.AimTouchSGBone or 1 end, SetFunc = function(c,v) local n = math.floor(v+0.5); if n<1 then n=1 end; if n>4 then n=4 end; D.AimTouchSGBone = n return true end },
-        { Key = "ModMenu_AT_SG_Cond", UI = AM.Slider, Text = 991037, ExpandHandle = "ModMenu_AT_SG_Ex", MinValue = 1, MaxValue = 2, min = 1, max = 2, Min = 1, Max = 2, GetFunc = function() return D.AimTouchSGCond or 1 end, SetFunc = function(c,v) local n = math.floor(v+0.5); if n<1 then n=1 end; if n>2 then n=2 end; D.AimTouchSGCond = n return true end },
         { Key = "ModMenu_AT_SG_Spd", UI = AM.Slider, Text = 991038, ExpandHandle = "ModMenu_AT_SG_Ex", MinValue = 1, MaxValue = 100, min = 1, max = 100, GetFunc = function() return D.AimTouchSGSpeed or 75 end, SetFunc = function(c,v) D.AimTouchSGSpeed = v return true end },
         { Key = "ModMenu_AT_SG_FOV", UI = AM.Slider, Text = 991039, ExpandHandle = "ModMenu_AT_SG_Ex", MinValue = 1, MaxValue = 100, min = 1, max = 100, GetFunc = function() return D.AimTouchSGFOV or 15 end, SetFunc = function(c,v) D.AimTouchSGFOV = v return true end },
-        { Key = "ModMenu_AT_SG_Dist", UI = AM.Slider, Text = 991040, ExpandHandle = "ModMenu_AT_SG_Ex", MinValue = 1, MaxValue = 100, min = 1, max = 100, GetFunc = function() return D.AimTouchSGDist or 100 end, SetFunc = function(c,v) D.AimTouchSGDist = v return true end },
-        { Key = "ModMenu_AT_SG_Recoil", UI = AM.Slider, Text = 991041, ExpandHandle = "ModMenu_AT_SG_Ex", MinValue = 0, MaxValue = 100, min = 0, max = 100, GetFunc = function() return D.AimTouchSGRecoil or 100 end, SetFunc = function(c,v) D.AimTouchSGRecoil = v return true end },
 
-        -- Scope Aimbot (All Sliders & Toggles Restored)
         { Key = "ModMenu_AT_ScopeAll_Ex", UI = AM.TitleSwitcher, Text = 991050, ExpandHandle = "ModMenu_AT_Ex", ExpandIndex = 0, GetFunc = function() return C.AimTouchScopeAll end, SetFunc = function(c,v) C.AimTouchScopeAll = v return true end },
         { Key = "ModMenu_AT_ScopeAll_IgKnock", UI = AM.Switcher, Text = 991051, ExpandHandle = "ModMenu_AT_ScopeAll_Ex", GetFunc = function() return C.AimTouchScopeIgKnock end, SetFunc = function(c,v) C.AimTouchScopeIgKnock = v return true end },
         { Key = "ModMenu_AT_ScopeAll_IgBot", UI = AM.Switcher, Text = 991052, ExpandHandle = "ModMenu_AT_ScopeAll_Ex", GetFunc = function() return C.AimTouchScopeIgBot end, SetFunc = function(c,v) C.AimTouchScopeIgBot = v return true end },
         { Key = "ModMenu_AT_ScopeAll_Vis", UI = AM.Switcher, Text = 991053, ExpandHandle = "ModMenu_AT_ScopeAll_Ex", GetFunc = function() return C.AimTouchScopeVisCheck end, SetFunc = function(c,v) C.AimTouchScopeVisCheck = v return true end },
-        { Key = "ModMenu_AT_ScopeAll_Prio", UI = AM.Slider, Text = 991054, ExpandHandle = "ModMenu_AT_ScopeAll_Ex", MinValue = 1, MaxValue = 4, min = 1, max = 4, Min = 1, Max = 4, GetFunc = function() return D.AimTouchScopePrio or 1 end, SetFunc = function(c,v) local n = math.floor(v+0.5); if n<1 then n=1 end; if n>4 then n=4 end; D.AimTouchScopePrio = n return true end },
-        { Key = "ModMenu_AT_ScopeAll_Bone", UI = AM.Slider, Text = 991055, ExpandHandle = "ModMenu_AT_ScopeAll_Ex", MinValue = 1, MaxValue = 4, min = 1, max = 4, Min = 1, Max = 4, GetFunc = function() return D.AimTouchScopeBone or 1 end, SetFunc = function(c,v) local n = math.floor(v+0.5); if n<1 then n=1 end; if n>4 then n=4 end; D.AimTouchScopeBone = n return true end },
-        { Key = "ModMenu_AT_ScopeAll_Cond", UI = AM.Slider, Text = 991056, ExpandHandle = "ModMenu_AT_ScopeAll_Ex", MinValue = 1, MaxValue = 2, min = 1, max = 2, Min = 1, Max = 2, GetFunc = function() return D.AimTouchScopeCond or 1 end, SetFunc = function(c,v) local n = math.floor(v+0.5); if n<1 then n=1 end; if n>2 then n=2 end; D.AimTouchScopeCond = n return true end },
         { Key = "ModMenu_AT_ScopeAll_Spd", UI = AM.Slider, Text = 991057, ExpandHandle = "ModMenu_AT_ScopeAll_Ex", MinValue = 1, MaxValue = 100, min = 1, max = 100, GetFunc = function() return D.AimTouchScopeSpeed or 100 end, SetFunc = function(c,v) D.AimTouchScopeSpeed = v return true end },
         { Key = "ModMenu_AT_ScopeAll_FOV", UI = AM.Slider, Text = 991058, ExpandHandle = "ModMenu_AT_ScopeAll_Ex", MinValue = 1, MaxValue = 100, min = 1, max = 100, GetFunc = function() return D.AimTouchScopeFOV or 15 end, SetFunc = function(c,v) D.AimTouchScopeFOV = v return true end },
-        { Key = "ModMenu_AT_ScopeAll_Dist", UI = AM.Slider, Text = 991059, ExpandHandle = "ModMenu_AT_ScopeAll_Ex", MinValue = 1, MaxValue = 100, min = 1, max = 100, GetFunc = function() return math.floor((D.AimTouchScopeDist or 500) / 5) end, SetFunc = function(c,v) D.AimTouchScopeDist = v * 5 return true end },
         { Key = "ModMenu_AT_ScopeAll_Pred", UI = AM.Slider, Text = 991060, ExpandHandle = "ModMenu_AT_ScopeAll_Ex", MinValue = 0, MaxValue = 100, min = 0, max = 100, GetFunc = function() return D.AimTouchScopePred or 26 end, SetFunc = function(c,v) D.AimTouchScopePred = v return true end },
         { Key = "ModMenu_AT_ScopeAll_Recoil", UI = AM.Slider, Text = 991061, ExpandHandle = "ModMenu_AT_ScopeAll_Ex", MinValue = 0, MaxValue = 100, min = 0, max = 100, GetFunc = function() return D.AimTouchScopeRecoil or 6 end, SetFunc = function(c,v) D.AimTouchScopeRecoil = v return true end },
-        { Key = "ModMenu_AT_ScopeAll_Precision", UI = AM.Slider, Text = 991062, ExpandHandle = "ModMenu_AT_ScopeAll_Ex", MinValue = 0, MaxValue = 100, min = 0, max = 100, GetFunc = function() return D.AimTouchPrecision or 100 end, SetFunc = function(c,v) D.AimTouchPrecision = v return true end },
 
-        -- Sniper Aimbot (All Sliders & Toggles Restored)
         { Key = "ModMenu_AT_Sniper_Ex", UI = AM.TitleSwitcher, Text = 991070, ExpandHandle = "ModMenu_AT_Ex", ExpandIndex = 0, GetFunc = function() return C.AimTouchScopeSniper end, SetFunc = function(c,v) C.AimTouchScopeSniper = v return true end },
         { Key = "ModMenu_AT_Sniper_IgKnock", UI = AM.Switcher, Text = 991071, ExpandHandle = "ModMenu_AT_Sniper_Ex", GetFunc = function() return C.AimTouchSniperIgKnock end, SetFunc = function(c,v) C.AimTouchSniperIgKnock = v return true end },
         { Key = "ModMenu_AT_Sniper_IgBot", UI = AM.Switcher, Text = 991072, ExpandHandle = "ModMenu_AT_Sniper_Ex", GetFunc = function() return C.AimTouchSniperIgBot end, SetFunc = function(c,v) C.AimTouchSniperIgBot = v return true end },
         { Key = "ModMenu_AT_Sniper_Vis", UI = AM.Switcher, Text = 991073, ExpandHandle = "ModMenu_AT_Sniper_Ex", GetFunc = function() return C.AimTouchSniperVisCheck end, SetFunc = function(c,v) C.AimTouchSniperVisCheck = v return true end },
-        { Key = "ModMenu_AT_Sniper_Prio", UI = AM.Slider, Text = 991074, ExpandHandle = "ModMenu_AT_Sniper_Ex", MinValue = 1, MaxValue = 4, min = 1, max = 4, Min = 1, Max = 4, GetFunc = function() return D.AimTouchSniperPrio or 1 end, SetFunc = function(c,v) local n = math.floor(v+0.5); if n<1 then n=1 end; if n>4 then n=4 end; D.AimTouchSniperPrio = n return true end },
-        { Key = "ModMenu_AT_Sniper_Bone", UI = AM.Slider, Text = 991075, ExpandHandle = "ModMenu_AT_Sniper_Ex", MinValue = 1, MaxValue = 4, min = 1, max = 4, Min = 1, Max = 4, GetFunc = function() return D.AimTouchSniperBone or 1 end, SetFunc = function(c,v) local n = math.floor(v+0.5); if n<1 then n=1 end; if n>4 then n=4 end; D.AimTouchSniperBone = n return true end },
-        { Key = "ModMenu_AT_Sniper_Cond", UI = AM.Slider, Text = 991076, ExpandHandle = "ModMenu_AT_Sniper_Ex", MinValue = 1, MaxValue = 2, min = 1, max = 2, Min = 1, Max = 2, GetFunc = function() return D.AimTouchSniperCond or 2 end, SetFunc = function(c,v) local n = math.floor(v+0.5); if n<1 then n=1 end; if n>2 then n=2 end; D.AimTouchSniperCond = n return true end },
         { Key = "ModMenu_AT_Sniper_Spd", UI = AM.Slider, Text = 991077, ExpandHandle = "ModMenu_AT_Sniper_Ex", MinValue = 1, MaxValue = 100, min = 1, max = 100, GetFunc = function() return D.AimTouchSniperSpeed or 100 end, SetFunc = function(c,v) D.AimTouchSniperSpeed = v return true end },
         { Key = "ModMenu_AT_Sniper_FOV", UI = AM.Slider, Text = 991078, ExpandHandle = "ModMenu_AT_Sniper_Ex", MinValue = 1, MaxValue = 100, min = 1, max = 100, GetFunc = function() return D.AimTouchSniperFOV or 15 end, SetFunc = function(c,v) D.AimTouchSniperFOV = v return true end },
-        { Key = "ModMenu_AT_Sniper_Dist", UI = AM.Slider, Text = 991079, ExpandHandle = "ModMenu_AT_Sniper_Ex", MinValue = 1, MaxValue = 100, min = 1, max = 100, GetFunc = function() return math.floor((D.AimTouchSniperDist or 500) / 5) end, SetFunc = function(c,v) D.AimTouchSniperDist = v * 5 return true end },
-        { Key = "ModMenu_AT_Sniper_Pred", UI = AM.Slider, Text = 991080, ExpandHandle = "ModMenu_AT_Sniper_Ex", MinValue = 0, MaxValue = 100, min = 0, max = 100, GetFunc = function() return D.AimTouchSniperPred or 26 end, SetFunc = function(c,v) D.AimTouchSniperPred = v return true end },
-        { Key = "ModMenu_AT_Sniper_Recoil", UI = AM.Slider, Text = 991081, ExpandHandle = "ModMenu_AT_Sniper_Ex", MinValue = 0, MaxValue = 100, min = 0, max = 100, GetFunc = function() return D.AimTouchSniperRecoil or 0 end, SetFunc = function(c,v) D.AimTouchSniperRecoil = v return true end },
-
-        -- Mortar Aimbot (Restored)
-        { Key = "ModMenu_AT_Mortar_Ex", UI = AM.TitleSwitcher, Text = 991090, ExpandHandle = "ModMenu_AT_Ex", ExpandIndex = 0, GetFunc = function() return C.AimTouchMortar end, SetFunc = function(c,v) C.AimTouchMortar = v return true end },
-        { Key = "ModMenu_AT_Mortar_FOV", UI = AM.Slider, Text = 991091, ExpandHandle = "ModMenu_AT_Mortar_Ex", MinValue = 1, MaxValue = 360, min = 1, max = 360, GetFunc = function() return D.AimTouchMortarFOV or 360 end, SetFunc = function(c,v) D.AimTouchMortarFOV = v return true end },
-        { Key = "ModMenu_AT_Mortar_Pred", UI = AM.Slider, Text = 991092, ExpandHandle = "ModMenu_AT_Mortar_Ex", MinValue = 0, MaxValue = 100, min = 0, max = 100, GetFunc = function() return D.AimTouchMortarPred or 0 end, SetFunc = function(c,v) D.AimTouchMortarPred = v return true end }
+        { Key = "ModMenu_AT_Sniper_Pred", UI = AM.Slider, Text = 991080, ExpandHandle = "ModMenu_AT_Sniper_Ex", MinValue = 0, MaxValue = 100, min = 0, max = 100, GetFunc = function() return D.AimTouchSniperPred or 26 end, SetFunc = function(c,v) D.AimTouchSniperPred = v return true end }
     }
 
     local StackSuperBullet = {
-        { Key = "SuperBullet_Main", UI = AM.TitleSwitcher, Text = 991200, ExpandIndex = 0,
-          GetFunc = function() return C.SuperBulletSG end,
-          SetFunc = function(c,v)
-              C.SuperBulletSG = v
-              if not v then
-                  pcall(function()
-                      local player = GetLocalPlayerAndPC()
-                      if Valid(player) and player.WeaponManagerComponent then
-                          local weapon = player.WeaponManagerComponent.CurrentWeaponReplicated
-                          if Valid(weapon) then
-                              local candidates = { weapon.ShootWeaponEntityComp, weapon.ShootWeaponEntity, weapon.ShootWeaponEntity_GEN_VARIABLE, weapon.ShootWeaponComponent }
-                              for _, se in ipairs(candidates) do
-                                  if Valid(se) and se._OrigBulletNum then
-                                      se.BulletNumSingleShot = se._OrigBulletNum
-                                      se._OrigBulletNum = nil
-                                      se._AppliedSB = nil
-                                  end
-                              end
-                          end
-                      end
-                  end)
-              end
-              return true
-          end },
-        { Key = "SuperBullet_Count", UI = AM.Slider, Text = 991201, ExpandHandle = "SuperBullet_Main",
-          MinValue = 1, MaxValue = 20, min = 1, max = 20, Min = 1, Max = 20,
-          GetFunc = function() return C.SuperBulletSGCount or 20 end,
-          SetFunc = function(c,v)
-              local n = math.floor(v + 0.5)
-              if n < 1 then n = 1 end
-              if n > 20 then n = 20 end
-              C.SuperBulletSGCount = n
-              return true
-          end }
+        { Key = "SuperBullet_Main", UI = AM.TitleSwitcher, Text = 991200, ExpandIndex = 0, GetFunc = function() return C.SuperBulletSG end, SetFunc = function(c,v) C.SuperBulletSG = v return true end },
+        { Key = "SuperBullet_Count", UI = AM.Slider, Text = 991201, ExpandHandle = "SuperBullet_Main", MinValue = 1, MaxValue = 20, min = 1, max = 20, GetFunc = function() return C.SuperBulletSGCount or 20 end, SetFunc = function(c,v) C.SuperBulletSGCount = math.floor(v + 0.5) return true end }
     }
 
     SPD.Aimbot.Category = {
@@ -18822,7 +18269,7 @@ function _G.InitMasterMenusV6()
         { Key = "ModMenu_ESP_HP",    UI = AM.Switcher, Text = 992007, ExpandHandle = "ModMenu_ESP_Main", GetFunc = function() return _G.Mod_ESP_ShowHealthBar end, SetFunc = function(c,v) _G.Mod_ESP_ShowHealthBar = v return true end },
         { Key = "ModMenu_ESP_Line",  UI = AM.Switcher, Text = 992002, ExpandHandle = "ModMenu_ESP_Main", GetFunc = function() return _G.Mod_ESP_ShowSnapline end, SetFunc = function(c,v) _G.Mod_ESP_ShowSnapline = v return true end },
         { Key = "ModMenu_ESP_WH",    UI = AM.Switcher, Text = 992004, ExpandHandle = "ModMenu_ESP_Main", GetFunc = function() return _G.Mod_ESP_Wallhack end, SetFunc = function(c,v) _G.Mod_ESP_Wallhack = v return true end },
-        { Key = "ModMenu_ESP_Thick", UI = AM.Slider,   Text = 992010, ExpandHandle = "ModMenu_ESP_Main", MinValue = 1, MaxValue = 10, min = 1, max = 10, Min = 1, Max = 10, GetFunc = function() return tonumber(_G.Mod_ESP_SnaplineThickness) or 1 end, SetFunc = function(c,v) local n = math.floor(v+0.5); if n<1 then n=1 end; if n>10 then n=10 end; _G.Mod_ESP_SnaplineThickness = n return true end },
+        { Key = "ModMenu_ESP_Thick", UI = AM.Slider,   Text = 992010, ExpandHandle = "ModMenu_ESP_Main", MinValue = 1, MaxValue = 5, min = 1, max = 5, GetFunc = function() return tonumber(_G.Mod_ESP_SnaplineThickness) or 1 end, SetFunc = function(c,v) _G.Mod_ESP_SnaplineThickness = math.floor(v+0.5) return true end },
         { Key = "ModMenu_ESP5_Main", UI = AM.Switcher, Text = 992012, ExpandHandle = "ModMenu_ESP_Main", GetFunc = function() return C.EspLoai5 end, SetFunc = function(c,v) C.EspLoai5 = v return true end }
     }
     SPD.ESP.Category = { { Key = "Cat_ESP", Text = 999004, Stack = StackESP } }
@@ -18861,11 +18308,11 @@ end
 
 pcall(_G.InitMasterMenusV6)
 if Game and Game.SetTimer then
-    -- FIX: guarded; this ran during the handoff when Game was nil.
-SafeSetTimer(2.0, false, function() pcall(_G.InitMasterMenusV6) end)
+    Game:SetTimer(2.0, false, function() pcall(_G.InitMasterMenusV6) end)
 end
 
-print("[VIP STANDALONE V6.1] Loaded — Full Aimbot Sliders + Green/Red Chams + Multi-Match V6 Engine")
+print("[VIP STANDALONE V6] Loaded — Multi-Match Persistent + Native UMG Name/HP/Dist + Full-Body Chams")
+
 
 ]===])
 
@@ -18873,9 +18320,147 @@ print("[VIP STANDALONE V6.1] Loaded — Full Aimbot Sliders + Green/Red Chams + 
 -- 3. 3.lua
 -- ============================================================================
 __defer_feature('3.lua', [===[
--- 165 FPS unlock / limiter removed for performance and stability.
--- The native graphics settings now own FPS; no forced t.MaxFPS or
--- r.FrameRateLimit overrides are installed.
+-- 165 FPS Unlock (FPS only)
+
+local KismetMathLibrary_1 = import("KismetMathLibrary")
+
+local logic_setting_graphics_1 = package.loaded["client.slua.logic.setting.logic_setting_graphics"] or require("client.slua.logic.setting.logic_setting_graphics")
+local GSC_FPS_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPS"] or require("client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPS")
+local GSC_FPSFT_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPSFT"] or require("client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPSFT")
+local GraphicSettingDB_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.GraphicSettingDB"] or require("client.slua.umg.NewSetting.GraphicsNew.GraphicSettingDB")
+
+if logic_setting_graphics_1 then
+    local var_132 = logic_setting_graphics_1.SetFPS
+    function logic_setting_graphics_1.SetFPS(gameInstance, FPSLevel)
+        if FPSLevel == 8 and GraphicSettingDB_1 then
+            local var_234 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
+            if not var_234 then
+                GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneSwitch, true)
+            end
+        end
+        if var_132 then
+            var_132(gameInstance, FPSLevel)
+        end
+        if FPSLevel == 8 and GraphicSettingDB_1 then
+            GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneNum, 165)
+            gameInstance:ExecuteCMD("t.MaxFPS", "165")
+            gameInstance:ExecuteCMD("r.FrameRateLimit", "165")
+        end
+    end
+end
+
+if GSC_FPS_1 and GSC_FPS_1.__inner_impl then
+    local var_160 = GSC_FPS_1.__inner_impl
+    function var_160:GetMaxFPSLevel() return 8, 8 end
+    function var_160:CanChangeQualityAndFPSPreCheck() return true end
+    function var_160:InitRealSupportFPS()
+        local var_29 = {}
+        for i = 1, 8 do var_29[i] = {true, true} end
+        if GraphicSettingDB_1 then GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.RealSupportFPS, var_29, false) end
+        return var_29
+    end
+    function var_160:SetFPSAndQualityEnable(bEnable)
+        if self.UIRoot and self.UIRoot.Image_Mask then self:SetWidgetVisible(self.UIRoot.Image_Mask, false) end
+    end
+    function var_160:UpdateSelectedFPSState(selectedLevel)
+        local var_37 = { [2]="NodeFps20", [3]="NodeFps25", [4]="NodeFps30", [5]="NodeFps40", [6]="NodeFps60", [7]="NodeFps90", [8]="NodeFps120" }
+        if not self.UIRoot then return end
+        for level, name in pairs(var_37) do
+            if self.UIRoot[name] then
+                self:WidgetSelfHit(self.UIRoot[name])
+                self.UIRoot[name]:SetIsEnabled(true)
+                local var_54 = self.UIRoot["WidgetSwitcher_" .. level]
+                if var_54 then var_54:SetActiveWidgetIndex(level == selectedLevel and 0 or 1) end
+            end
+        end
+    end
+    local var_58 = var_160.UpdateUI
+    function var_160:UpdateUI()
+        if var_58 then pcall(var_58, self) end
+        self:SelfHitTestInvisible()
+        self:InitRealSupportFPS()
+        self:SetFPSAndQualityEnable(true)
+        local var_222 = 8
+        if GraphicSettingDB_1 then
+            if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.CustomTab) == 2 then
+                var_222 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.LobbyFPS) or 8
+            else
+                var_222 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.SelectedFPS) or 8
+            end
+        end
+        self:UpdateSelectedFPSState(var_222)
+    end
+    function var_160:DoClickFPS(FPSLevel)
+        if slua.isValid(self.UIRoot) then
+            if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.CustomTab) == 2 then
+                GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.LobbyFPS, FPSLevel)
+            else
+                GraphicSettingDB_1:UpdateSelectedFPS(FPSLevel)
+            end
+            self:UpdateSelectedFPSState(FPSLevel)
+            if self:GetParentUI() then
+                self:GetParentUI():SaveQualityAndFPS()
+                self:GetParentUI():SetDirty(true)
+            end
+        end
+    end
+end
+
+if GSC_FPSFT_1 and GSC_FPSFT_1.__inner_impl then
+    local var_13 = GSC_FPSFT_1.__inner_impl
+    local var_93, var_203 = 90, 5
+    local function func_6(val, min, max) return val < min and min or (val > max and max or val) end
+    function var_13:ShowOrHide()
+        self:SelfHitTestInvisible()
+        if self.InitFPSFTSwitch then self:InitFPSFTSwitch() end
+    end
+    function var_13:InitFPSFTSwitch()
+        local sw = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
+        if self.UIRoot.Setting_Switch then self.UIRoot.Setting_Switch:SetSwitcherEnable2(sw, true) end
+        if self.UIRoot.CanvasPanel_8 then self:SetWidgetVisible(self.UIRoot.CanvasPanel_8, sw) end
+        if self.UIRoot.WidgetSwitcher_0 then self.UIRoot.WidgetSwitcher_0:SetActiveWidgetIndex(2) end
+        if self.InitFPSFTValue165 then self:InitFPSFTValue165() end
+    end
+    function var_13:InitFPSFTValue165()
+        local var_202 = self.UIRoot
+        local sw = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
+        local var_69 = sw and GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum) or 165
+        var_202.Slider_screen3:SetLocked(not sw)
+        var_202.ProgressBar_screen3:SetFillColorAndOpacity(sw and FLinearColor(1,1,1,1) or FLinearColor(1,0.625,0.6,1))
+        local var_60 = (var_69 - var_93) / (165 - var_93)
+        var_202.Veihclescreen3:SetText(LocUtil.LocalizeResFormat(10567, var_69))
+        var_202.Slider_screen3:SetValue(var_60)
+        var_202.ProgressBar_screen3:SetPercent(var_60)
+    end
+    function var_13:OnFPSFTValueChange3(var_69)
+        GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneNum, var_69)
+        self:InitFPSFTValue165()
+        if self:GetParentUI() then self:GetParentUI():SetDirty(true) end
+        local var_43 = GraphicSettingDB_1.GetGameInstance and GraphicSettingDB_1.GetGameInstance()
+        if var_43 then
+            var_43:ExecuteCMD("t.MaxFPS", tostring(var_69))
+            var_43:ExecuteCMD("r.FrameRateLimit", tostring(var_69))
+        end
+    end
+    function var_13:OnFPSFTSliderValueChange3(var_174)
+        if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch) then
+            local var_69 = KismetMathLibrary_1.FCeil(var_174 * (165 - var_93) / var_203) * var_203 + var_93
+            self:OnFPSFTValueChange3(func_6(var_69, var_93, 165))
+        end
+    end
+    function var_13:OnFPSFTAdd3()
+        local var_69 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum)
+        if var_69 then self:OnFPSFTValueChange3(math.min(165, var_69 + var_203)) end
+    end
+    function var_13:OnFPSFTMinus3()
+        local var_69 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum)
+        if var_69 then self:OnFPSFTValueChange3(math.max(var_93, var_69 - var_203)) end
+    end
+    var_13.OnFPSFTAdd = var_13.OnFPSFTAdd3
+    var_13.OnFPSFTMinus = var_13.OnFPSFTMinus3
+    var_13.OnFPSFTSliderValueChange = var_13.OnFPSFTSliderValueChange3
+end
+
 ]===])
 
 -- ============================================================================
