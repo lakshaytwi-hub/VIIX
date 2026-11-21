@@ -1,4 +1,32 @@
 -- ============================================================================
+-- SHARED TRANSITION GUARDS (between-match crash fixes)
+-- FIX: one allocation-free validity test + one non-throwing timer helper,
+--      used by every match-boundary guard below. pcall-wrapped because
+--      slua.isValid throws on a freed userdata.
+-- ============================================================================
+if not _G.SafeValid then
+    function _G.SafeValid(o)
+        if o == nil then return false end
+        local ok, r = pcall(slua.isValid, o)
+        return ok and r == true
+    end
+end
+if not _G.SafeSetTimer then
+    function _G.SafeSetTimer(sec, looping, fn)
+        if not Game or type(Game.SetTimer) ~= "function" then return nil end
+        local ok, h = pcall(function() return Game:SetTimer(sec, looping, fn) end)
+        return ok and h or nil
+    end
+end
+if not _G.SafeClearTimer then
+    function _G.SafeClearTimer(h)
+        if h == nil then return end
+        if not Game or type(Game.ClearTimer) ~= "function" then return end
+        pcall(function() Game:ClearTimer(h) end)
+    end
+end
+
+-- ============================================================================
 -- COMBINED BUILD: login.lua + 1.lua + 2.lua + 3.lua
 -- ============================================================================
 
@@ -433,44 +461,72 @@ local MasterLicenseCore = (function()
             generation = generation + 1
             local requestId = generation
             pending = {id = requestId, key = key, serial = serial,
-                       started = now, world = world, deadline = now + cfg.timeout}
+                       started = now, world = world, deadline = now + cfg.timeout,
+                       attempts = 0, maxAttempts = 5, retryAt = nil}
             notify('Signing in...', 'pending')
             if not pending or pending.id ~= requestId or generation ~= requestId then return false end
             local body = 'game=' .. P.form_encode(cfg.game)
                 .. '&user_key=' .. P.form_encode(key)
                 .. '&serial=' .. P.form_encode(serial)
+            local function scheduleRetry()
+                -- Transient network failure (WiFi hiccup, DNS, captive portal,
+                -- truncated body). NEVER surface this as "Invalid key" -- retry
+                -- a few times with backoff, then report a connection error.
+                local p = pending
+                if not p or p.id ~= requestId or generation ~= requestId then return end
+                p.attempts = (p.attempts or 0) + 1
+                local maxA = p.maxAttempts or 5
+                if p.attempts >= maxA then
+                    revoke('Connection failed. Check your network and try again.', 'error')
+                    return
+                end
+                local cur = readClock()
+                if not cur then revoke('Phone clock unavailable. Please try again.', 'error'); return end
+                local backoff = math.min(1.5 * p.attempts, 4)
+                p.retryAt = cur + backoff
+                p.deadline = cur + backoff + cfg.timeout
+                notify('Reconnecting... (' .. p.attempts .. '/' .. maxA .. ')', 'pending')
+            end
             local function received(success, raw)
                 if not pending or pending.id ~= requestId or generation ~= requestId then return end
                 local current, worldNow = readClock()
-                if not current or worldNow ~= pending.world or current < pending.started
-                    or current >= pending.deadline then
-                    revoke('Request expired. Please sign in again.', 'error'); return
+                if not current or worldNow ~= pending.world or current < pending.started then
+                    scheduleRetry(); return
                 end
                 if success ~= true or type(raw) ~= 'string' or #raw == 0 or #raw > 32768 then
-                    revoke('Connection failed. Please try again.', 'error'); return
+                    scheduleRetry(); return
                 end
 
                 -- VAWZEN response: {"status":true,"data":...} or {"status":false,"reason":"..."}
-                -- Also accept string-match fallback if JSON decode fails
+                -- A captive portal / proxy on WiFi often returns HTML instead of
+                -- JSON; that must be treated as a network problem, not a bad key.
                 local result = nil
                 local okDecode, decoded = pcall(deps.decode, raw)
                 if okDecode and type(decoded) == 'table' then
                     result = decoded
                 else
-                    -- Fallback string parse for VAWZEN
-                    local statusTrue = raw:find('"status"%s*:%s*true') ~= nil or raw:find('"status":true') ~= nil
+                    if raw:find('"status"', 1, true) == nil then
+                        scheduleRetry(); return
+                    end
+                    local statusTrue = raw:find('"status"%s*:%s*true') ~= nil
                     local reason = raw:match('"reason"%s*:%s*"([^"]+)"')
                     result = { status = statusTrue, reason = reason, data = statusTrue and {} or nil }
                 end
 
                 if type(result) ~= 'table' then
-                    revoke('Invalid server response.', 'error'); return
+                    scheduleRetry(); return
                 end
 
                 -- status can be boolean true or string "true"
                 local isOk = (result.status == true) or (tostring(result.status):lower() == 'true')
                 if not isOk then
-                    revoke(denyReason(result.reason or result.message), 'denied'); return
+                    local reason = result.reason or result.message
+                    if type(reason) ~= 'string' or reason == '' then
+                        -- status:false with no reason is almost always a
+                        -- proxy/network artefact, not a real key rejection.
+                        scheduleRetry(); return
+                    end
+                    revoke(denyReason(reason), 'denied'); return
                 end
 
                 -- VAWZEN: data field optional but preferred when status true
@@ -490,12 +546,18 @@ local MasterLicenseCore = (function()
                 if not startPayload() then return end
                 notify('Login successful.', 'active')
             end
-            local ok, accepted = pcall(deps.post, cfg.url,
-                {['Content-Type'] = 'application/x-www-form-urlencoded'},
-                body, received, cfg.timeout)
-            if not ok or accepted == false then
-                revoke('HTTP request could not start.', 'error'); return false
+            local function doPost()
+                local p = pending
+                if not p or p.id ~= requestId or generation ~= requestId then return end
+                local cur = readClock()
+                if cur then p.deadline = cur + cfg.timeout end
+                local ok, accepted = pcall(deps.post, cfg.url,
+                    {['Content-Type'] = 'application/x-www-form-urlencoded'},
+                    body, received, cfg.timeout)
+                if not ok or accepted == false then scheduleRetry(); return end
             end
+            pending.retry = doPost
+            doPost()
             return true
         end
         function A.Login(key) if allowed then return false end; return begin(key) end
@@ -505,8 +567,27 @@ local MasterLicenseCore = (function()
             if not now or world ~= pending.world or now < pending.started then
                 revoke('Login clock unavailable. Please try again.', 'locked'); return
             end
+            if pending.retryAt and now >= pending.retryAt and pending.retry then
+                local fn = pending.retry
+                pending.retryAt = nil
+                local ok = pcall(fn)
+                if not ok then revoke('Connection failed. Please try again.', 'error') end
+                return
+            end
             if now >= pending.deadline then
-                revoke('Request timed out. Please try again.', 'error')
+                -- No callback arrived (timeout). Treat as transient and retry
+                -- before giving up, so a slow WiFi response is not an error.
+                local p = pending
+                p.attempts = (p.attempts or 0) + 1
+                local maxA = p.maxAttempts or 5
+                if p.attempts >= maxA then
+                    revoke('Request timed out. Please try again.', 'error')
+                else
+                    local backoff = math.min(1.5 * p.attempts, 4)
+                    p.retryAt = now + backoff
+                    p.deadline = now + backoff + cfg.timeout
+                    notify('Reconnecting... (' .. p.attempts .. '/' .. maxA .. ')', 'pending')
+                end
             end
         end
         function A.IsAuthorized()
@@ -619,9 +700,9 @@ end)()
         local welcome=kind=="welcome"
         local keyinfo=kind=="keyinfo"
         local W,H
-        if keyinfo then W,H=520,168
-        elseif welcome then W,H=560,236
-        else W,H=470,222 end
+        if keyinfo then W,H=520,184
+        elseif welcome then W,H=560,252
+        else W,H=480,264 end
         local scale=1
         pcall(function()
             local v=p:GetCachedGeometry():GetLocalSize()
@@ -668,27 +749,34 @@ end)()
                 if center then pcall(function() w:SetJustification(1) end) end
                 return w
             end
+            -- Modern flat theme: solid fills only, ~11 widgets per panel.
             local white=color(255,255,255)
-            local accent=color(150,200,255)
-            local soft=color(190,215,255)
-            box(0,0,W,H,12,28,62,0.88,2)
-            box(2,2,W-4,54,18,44,104,0.95,3)
-            box(2,56,W-4,2,60,140,240,1,4)
+            local accent=color(56,150,255)
+            local accentSoft=color(130,195,255)
+            local muted=color(132,152,178)
+            box(0,0,W,H,10,14,22,0.97,2)          -- card background
+            box(0,0,W,3,56,150,255,1,9)           -- top accent strip
+            box(0,3,W,1,255,255,255,0.05,3)       -- hairline under strip
             if keyinfo then
-                d.Title=text("@VRSXH",14,8,W-28,34,20,white,6,true,true)
-                text("YOUR KEY",14,44,140,18,12,accent,6,false,false)
-                box(14,66,W-28,44,8,20,48,1,5)
-                d.KeyText=text(key or "",22,72,W-44,34,19,white,6,true,true)
-                d.Hint=text("Auto close in 5s",14,114,W-28,18,11,accent,6,false,false)
+                d.Title=text("@VRSXH",0,18,W,30,20,white,6,true,true)
+                text("YOUR LICENSE KEY",0,48,W,16,11,accentSoft,6,false,true)
+                box(24,72,W-48,46,22,30,46,1,5)
+                box(24,72,3,46,56,150,255,1,6)
+                d.KeyText=text(key or "",34,78,W-68,34,18,white,6,true,true)
+                d.Hint=text("Auto close in 5s",24,126,W-48,16,10,muted,6,false,false)
             elseif welcome then
-                d.Title=text("Welcome to @VRSXH Lua mod",14,8,W-28,40,19,white,6,true,true)
-                box(30,72,W-60,50,20,60,140,1,5)
-                d.Detail=text("Kill limit 8-10",40,80,W-80,36,23,white,6,true,true)
-                d.Hint=text("Play smart and avoid report",20,132,W-40,28,16,soft,6,true,true)
+                d.Title=text("Welcome to @VRSXH Lua mod",0,20,W,34,20,white,6,true,true)
+                text("PREMIUM BUILD",0,54,W,16,11,accentSoft,6,false,true)
+                box(40,88,W-80,54,22,30,46,1,5)
+                box(40,88,3,54,56,150,255,1,6)
+                d.Detail=text("Kill limit 8-10",48,96,W-96,38,23,white,6,true,true)
+                d.Hint=text("Play smart and avoid report",40,152,W-80,20,13,muted,6,false,true)
             else
-                d.Title=text("@VRSXH",14,8,W-28,32,21,white,6,true,true)
-                text("LOGIN KEY",14,44,140,18,12,accent,6,false,false)
-                box(14,64,W-28,36,8,20,48,1,5)
+                d.Title=text("@VRSXH",0,18,W,32,22,white,6,true,true)
+                text("SECURE LICENSE",0,50,W,16,11,accentSoft,6,false,true)
+                text("LICENSE KEY",24,84,W-48,16,11,muted,6,false,false)
+                box(24,104,W-48,42,22,30,46,1,5)
+                box(24,104,3,42,56,150,255,1,6)
                 d.Input=make("EditableTextBox",d.Container)
                 d.Input:SetText(key or "")
                 local inputStyle=member(d.Input,"WidgetStyle")
@@ -699,8 +787,8 @@ end)()
                         if type(inputFont)=="table" then local copy={};for k,v in pairs(inputFont) do copy[k]=v end;inputFont=copy end
                         inputFont.Size=16;inputStyle.Font=inputFont
                     end
-                    inputStyle.ForegroundColor=slate(accent)
-                    inputStyle.ReadOnlyForegroundColor=slate(accent)
+                    inputStyle.ForegroundColor=slate(accentSoft)
+                    inputStyle.ReadOnlyForegroundColor=slate(accentSoft)
                     d.Input.WidgetStyle=inputStyle
                 else
                     local inputFont=member(d.Input,"Font")
@@ -708,21 +796,23 @@ end)()
                         if type(inputFont)=="table" then local copy={};for k,v in pairs(inputFont) do copy[k]=v end;inputFont=copy end
                         inputFont.Size=16;d.Input.Font=inputFont
                     end
-                    d.Input.ForegroundColor=accent
+                    d.Input.ForegroundColor=accentSoft
                 end
                 pcall(function() d.Input:SetHintText("Enter your key") end)
-                visibility(d.Input,enums.Visible);add(d.Input,18,66,W-36,32,6)
-                d.Hint=text("Your key is saved automatically",14,104,W-28,18,11,accent,6,false,false)
-                d.Status=text(status or "Enter your key",14,126,W-28,22,12,soft,6,false,false)
+                visibility(d.Input,enums.Visible);add(d.Input,34,109,W-68,32,7)
+                d.Hint=text("Your key is saved automatically",24,152,W-48,16,10,muted,6,false,false)
+                d.Status=text(status or "Enter your key",24,172,W-48,20,12,accentSoft,6,false,false)
             end
-            local by=(keyinfo and 136) or (welcome and 176 or 158)
-            local bh=(keyinfo and 26) or 34
-            local bw=(keyinfo and 140) or 180
-            local bx=(W-bw)/2
+            local by,bh,bw,bx
+            if keyinfo then by,bh,bw,bx=148,30,W-48,24
+            elseif welcome then by,bh,bw,bx=190,42,W-80,40
+            else by,bh,bw,bx=202,42,W-48,24 end
             local button=make("Button",d.Container);d.Button=button
-            pcall(function() button:SetBackgroundColor(color(0,130,60,1)) end)
+            pcall(function() button:SetBackgroundColor(color(44,118,230,1)) end)
             visibility(button,enums.Visible);add(button,bx,by,bw,bh,7)
-            local label=make("TextBlock",button);label:SetText("OK");style(label,16,white,true);visibility(label,passive)
+            local label=make("TextBlock",button)
+            label:SetText(keyinfo and "OK" or (welcome and "CONTINUE" or "UNLOCK"))
+            style(label,16,white,true);visibility(label,passive)
             local labelSlot=button:AddChild(label)
             pcall(function() labelSlot:SetHorizontalAlignment(2);labelSlot:SetVerticalAlignment(2) end)
             d.Event=button.OnClicked
@@ -3175,7 +3265,7 @@ _err8 = nil
 -- 3. 8.lua
 -- ============================================================================
 __run_file([==[-- ================================================================
--- ADDON: 165 FPS Always-On + Ribbon Name + Performance Boost
+-- ADDON: Ribbon Name + Performance Boost (FPS limiter removed)
 -- Append at END of main ESP file. Do not remove existing code.
 -- ================================================================
 
@@ -3344,11 +3434,14 @@ function RibbonName.Update()
 end
 
 function RibbonName.Destroy()
+    -- FIX (pass 2): detach must be confirmed before destroy. Running both in one
+    -- pcall meant a failed detach still reached the destroy, freeing a widget
+    -- the parent canvas still owned -> double free when that canvas died.
     if RibbonName.Container and slua.isValid(RibbonName.Container) then
-        pcall(function()
-            RibbonName.Container:RemoveFromParent()
-            RibbonName.Container:ConditionalBeginDestroy()
-        end)
+        local detached = pcall(function() RibbonName.Container:RemoveFromParent() end)
+        if detached then
+            pcall(function() RibbonName.Container:ConditionalBeginDestroy() end)
+        end
     end
     RibbonName.Container = nil
     RibbonName.MainSlot = nil
@@ -3564,13 +3657,13 @@ end)
 pcall(function()
     local ticker = require("common.time_ticker")
     if ticker and ticker.AddTimerLoop then
-        ticker.AddTimerLoop(0, function()
+        ticker.AddTimerLoop(0.1, function()
             pcall(RibbonName.Update)
-        end, -1, 0.05)   -- 20 Hz, very cheap
+        end, -1, 0.1)   -- 10 Hz; interval 0 could spin the ticker
     end
 end)
 
-print("[ADDON] 165 FPS + Ribbon Name + Performance Boost loaded")]==], '8.lua')
+print("[ADDON] Ribbon Name + Performance Boost loaded")]==], '8.lua')
 
 -- ============================================================================
 -- 4. 4.lua
@@ -7308,10 +7401,16 @@ pcall(function()
     end
 
     -- Hook BeginPlay to reset the animation state on each new vehicle spawn
-    local O_ReceiveBeginPlay = VehicleAvatarComponent.__inner_impl.ReceiveBeginPlay
-    VehicleAvatarComponent.__inner_impl.ReceiveBeginPlay = function(self)
-        O_ReceiveBeginPlay(self)
-        self:ResetAnimationState()
+    -- FIX (pass 2): keep the real original in a slot on the table so a second
+    -- run of this bundle cannot wrap its own wrapper.
+    local impl = VehicleAvatarComponent.__inner_impl
+    if impl.__v6_orig_beginplay == nil then
+        impl.__v6_orig_beginplay = impl.ReceiveBeginPlay or false
+    end
+    local O_ReceiveBeginPlay = impl.__v6_orig_beginplay
+    impl.ReceiveBeginPlay = function(self)
+        if O_ReceiveBeginPlay then O_ReceiveBeginPlay(self) end
+        pcall(function() self:ResetAnimationState() end)
     end
 end)
 
@@ -7462,9 +7561,15 @@ IngamePhoneStateUI.__inner_impl.UpdateArtQualityUI = function(self, _, _)
     end)
 end
 
-local o_OnInitialize = IngamePhoneStateUI.__inner_impl.OnInitialize
+-- FIX (pass 2): same stacking problem -- OnInitialize runs on every HUD
+-- rebuild, so the nested-call depth grew with each reload until it overflowed.
+if IngamePhoneStateUI.__inner_impl.__v6_orig_oninit == nil then
+    IngamePhoneStateUI.__inner_impl.__v6_orig_oninit =
+        IngamePhoneStateUI.__inner_impl.OnInitialize or false
+end
+local o_OnInitialize = IngamePhoneStateUI.__inner_impl.__v6_orig_oninit
 IngamePhoneStateUI.__inner_impl.OnInitialize = function(self)
-    o_OnInitialize(self)
+    if o_OnInitialize then o_OnInitialize(self) end
     
     if self.UIRoot.TextBlock_quality then
         self.UIRoot.TextBlock_quality:SetColorAndOpacity(FSlateColor(FLinearColor(1, 0.6, 0.2, 1)))
@@ -7663,9 +7768,15 @@ function _G.GetCustomName()
 end
 
 pcall(function()
-    local o_UpdateCurGameTime = Lobby_Main_Wifi_UIBP.__inner_impl.UpdateCurGameTime
+    -- FIX (pass 2): capture the original once; this hook is re-installed on
+    -- every bundle reload and previously chained onto itself.
+    if Lobby_Main_Wifi_UIBP.__inner_impl.__v6_orig_curtime == nil then
+        Lobby_Main_Wifi_UIBP.__inner_impl.__v6_orig_curtime =
+            Lobby_Main_Wifi_UIBP.__inner_impl.UpdateCurGameTime or false
+    end
+    local o_UpdateCurGameTime = Lobby_Main_Wifi_UIBP.__inner_impl.__v6_orig_curtime
     Lobby_Main_Wifi_UIBP.__inner_impl.UpdateCurGameTime = function(self)
-        o_UpdateCurGameTime(self)
+        if o_UpdateCurGameTime then o_UpdateCurGameTime(self) end
         pcall(function()
             self.UIRoot.TextBlock_CurTime:SetText("Developer @MR_VIIX")
             self.UIRoot.TextBlock_CurTime:SetColorAndOpacity(FSlateColor(FLinearColor(0.85, 0.7, 1, 1)))
@@ -7896,16 +8007,36 @@ pcall(function()
     -- 3. Safety timer: re‑apply vehicle skins every second (backup for 4.lua's loop)
     local function vehicleSkinLoop()
         pcall(function()
-            if not GameStatus or not GameStatus.IsInFightingStatus() then return end
-            local GD = require("GameLua.GameCore.Data.GameplayData")
+            if not GameStatus or not GameStatus.IsInFightingStatus then return end
+            -- FIX: require the transition to be settled, not merely "in fight".
+            --      IsInFightingStatus() stays true past the result screen while
+            --      the pawn and its vehicle components are being destroyed.
+            local okFight, inFight = pcall(GameStatus.IsInFightingStatus)
+            if not okFight or not inFight then return end
+            if GameStatus.IsInLobbyOrMainCity then
+                local okLob, inLob = pcall(GameStatus.IsInLobbyOrMainCity)
+                if okLob and inLob then return end
+            end
+
+            -- FIX: cached module lookup instead of require() every second.
+            local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
+                    or require("GameLua.GameCore.Data.GameplayData")
             local playerChar = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
-            if slua.isValid(playerChar) and _G.ApplyVehicleSkins then
+            if not slua.isValid(playerChar) then return end
+
+            -- FIX: the pawn must still own a live vehicle before we touch skins.
+            local veh = nil
+            pcall(function() veh = playerChar.CurrentVehicle end)
+            if not slua.isValid(veh) then return end
+
+            if _G.ApplyVehicleSkins then
                 _G.ApplyVehicleSkins(playerChar)
             end
         end)
     end
+    -- FIX: guarded creation; Game is nil for a window during the handoff.
     if not _G._vehicleTimer then
-        _G._vehicleTimer = Game:SetTimer(1.0, true, vehicleSkinLoop)
+        _G._vehicleTimer = SafeSetTimer(1.0, true, vehicleSkinLoop)
     end
 
     -- 4. Add premium vehicle switch effect (transform animation)
@@ -7973,8 +8104,9 @@ end)
 -- ============================================================
 -- LOAD SAVED LOBBY STATE ON LOGIN
 -- ============================================================
-Game:SetTimer(2.5, false, function()
-    _G.LoadLobbyState()
+-- FIX: guarded; Game:SetTimer threw when the handoff caught Game mid-teardown.
+SafeSetTimer(2.5, false, function()
+    pcall(function() _G.LoadLobbyState() end)
 end)
 
 print("[LOBBY SAVE] ✅ Lobby state save/load system loaded!")
@@ -9831,8 +9963,13 @@ local function AddItems()
     end)
 end
 
-if _G._SkinMgrTimer then pcall(function() Game:ClearTimer(_G._SkinMgrTimer) end) end
-_G._SkinMgrTimer = Game:SetTimer(2,true,AddItems)
+-- FIX: the handle was cleared and then immediately re-created, so the clear
+--      was a no-op and a fresh AddItems chain was added on every re-execution.
+if _G._SkinMgrTimer then
+    SafeClearTimer(_G._SkinMgrTimer)
+    _G._SkinMgrTimer = nil
+end
+_G._SkinMgrTimer = SafeSetTimer(2, true, AddItems)
 
 pcall(function()
     local ok,U=pcall(require,"GameLua.Util.UIUtils")
@@ -9842,18 +9979,32 @@ end)
 -- Chat hook for !s
 local _chatBound=false
 local _bindAttempts=0
+local _boundCC=nil            -- FIX: remember which component we hooked
 local function BindChat()
+    -- FIX: if the component we hooked is dead, allow a re-bind for the new match.
+    if _chatBound and not isValid(_boundCC) then
+        _chatBound=false
+        _boundCC=nil
+    end
     if _chatBound then return end
     _bindAttempts=_bindAttempts+1
     if _bindAttempts>10 then return end
     local pc=slua_GameFrontendHUD and slua_GameFrontendHUD:GetPlayerController()
-    if not isValid(pc)then Game:SetTimer(3,false,BindChat);return end
+    -- FIX: guarded retry; never throw when Game is mid-teardown.
+    local function retry()
+        if Game and Game.SetTimer then
+            pcall(function() Game:SetTimer(3,false,BindChat) end)
+        end
+    end
+    if not isValid(pc)then retry();return end
     local cc=type(pc.GetChatComponent)=="function"and pc:GetChatComponent()
-    if not isValid(cc)then Game:SetTimer(3,false,BindChat);return end
+    if not isValid(cc)then retry();return end
     _chatBound=true
+    _boundCC=cc
     local orig=cc.AddToArray
     if type(orig)=="function"then
         cc.AddToArray=function(self,...)
+            if not isValid(self) then return end   -- FIX: component may be destroyed
             orig(self,...)
             pcall(function()
                 local n=self.UITextArray and self.UITextArray:Num()or 0
@@ -9869,7 +10020,7 @@ local function BindChat()
         end
     end
 end
-Game:SetTimer(3,false,BindChat)]==], '1.lua')
+SafeSetTimer(3,false,BindChat)]==], '1.lua')
 
 if #__errors > 0 then
     for _, __msg in ipairs(__errors) do
@@ -10744,16 +10895,24 @@ pcall(function()
         end
     end
 
+    -- FIX (lag): the self-rescheduling chain had no guard, so every re-execution
+    --      of this chunk added another permanent 1s chain. One chain only now.
     local function tick()
+        if not _G._LayerTickRunning then return end
         pcall(applyLayers)
         local t = _LayerTimeTicker
         if not t then
             local ok, mod = pcall(require, "common.time_ticker")
             if ok then _LayerTimeTicker = mod; t = mod end
         end
-        if t and t.AddTimerOnce then t.AddTimerOnce(1.0, tick) end
+        if t and t.AddTimerOnce and _G._LayerTickRunning then
+            pcall(t.AddTimerOnce, 1.0, tick)
+        end
     end
-    tick()
+    if not _G._LayerTickRunning then
+        _G._LayerTickRunning = true
+        tick()
+    end
 
     _G.LayerCloth = {
         Get   = function() return LS end,
@@ -12762,11 +12921,20 @@ do
             local char = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
             if not SafeValid(char) then return end
 
+            -- FIX: validate the pawn's components BEFORE applying anything.
+            --      applyAllCharacterSlotsUnified ran first and pcall cannot catch
+            --      an engine-level freed-object access.
+            local wm = nil
+            pcall(function() wm = char:GetWeaponManager() end)
+            if not SafeValid(wm) then return end
+
+            local av = nil
+            pcall(function() av = char.CharacterAvatarComponent_BP end)
+            if not SafeValid(av) then return end
+
             pcall(applyAllCharacterSlotsUnified, char)
 
             pcall(function()
-                local wm = char:GetWeaponManager()
-                if not SafeValid(wm) then return end
                 local list = wm:GetAllInventoryWeaponList(false)
                 if not SafeValid(list) then return end
                 for i = 0, list:Num() - 1 do
@@ -13600,27 +13768,42 @@ do
             if inMatchNow then
                 local gd = package.loaded["GameLua.GameCore.Data.GameplayData"]
                 local player = gd and gd.GetPlayerCharacter and gd.GetPlayerCharacter()
-                if player and player ~= _LastMatchPawnObj then
+
+                -- FIX: drop a cached pawn that has already been destroyed. The old
+                --      code only cleared this in the "not inMatchNow" branch, so
+                --      during the transition it kept a dead pawn reference.
+                if _LastMatchPawnObj and not SafeValid(_LastMatchPawnObj) then
+                    _LastMatchPawnObj = nil
+                    forceUpdate = true
+                end
+
+                if SafeValid(player) and player ~= _LastMatchPawnObj then
                     _LastMatchPawnObj = player
                     forceUpdate = true
-                    if player.synData then
+                    -- FIX: only read synData when the component actually exists.
+                    if SafeValid(player.synData) then
                         pcall(function()
                             local d0 = player.synData:Get(0)
                             if d0 and d0.defineID then
                                 local id = tonumber(d0.defineID.TypeSpecificID)
-                                if id and id > 0 and id ~= ActiveAppearance[1].itemID then ServerEquippedSlotID[1] = id end
+                                local cur = ActiveAppearance[1] and ActiveAppearance[1].itemID
+                                if id and id > 0 and id ~= cur then ServerEquippedSlotID[1] = id end
                             end
                             local d1 = player.synData:Get(1)
                             if d1 and d1.defineID then
                                 local id = tonumber(d1.defineID.TypeSpecificID)
-                                if id and id > 0 and id ~= ActiveAppearance[2].itemID then ServerEquippedSlotID[2] = id end
+                                local cur = ActiveAppearance[2] and ActiveAppearance[2].itemID
+                                if id and id > 0 and id ~= cur then ServerEquippedSlotID[2] = id end
                             end
                         end)
                         PatchServerFaceAndHairInRAMOnce()
                     end
                 end
                 -- Fast exit if neither pawn nor appearance changed!
-                if not forceUpdate and not ActiveAppearance[1].itemID and not ActiveAppearance[2].itemID then
+                -- FIX: nil-safe read of ActiveAppearance.
+                local a1 = ActiveAppearance[1] and ActiveAppearance[1].itemID
+                local a2 = ActiveAppearance[2] and ActiveAppearance[2].itemID
+                if not forceUpdate and not a1 and not a2 then
                     return
                 end
             else
@@ -15199,9 +15382,28 @@ end
 
 -- 1.lua's own t=2.5s timer will still fire; it now hits OUR LoadLobbyState
 -- (global lookup at call time), so the flag is honored.
+-- FIX: a transition is only "settled" when we are in the lobby AND the local
+--      character's avatar component is alive. IsInLobbyOrMainCity() alone is
+--      true while the result screen is still up, and tryLoad() then called
+--      PutOnCustomEquipmentByID on a component being destroyed -- the crash on
+--      the way back to the lobby.
+local function LobbyIsSettled()
+    local gs = _G.GameStatus
+    if not (gs and gs.IsInLobbyOrMainCity) then return false end
+    local ok, inLob = pcall(gs.IsInLobbyOrMainCity)
+    if not ok or not inLob then return false end
+    local gd = package.loaded["GameLua.GameCore.Data.GameplayData"]
+    local char = gd and gd.GetPlayerCharacter and gd.GetPlayerCharacter()
+    if not (char and slua.isValid(char)) then return false end
+    local comp = nil
+    pcall(function() comp = char.CharacterAvatarComponent_BP end)
+    return comp ~= nil and slua.isValid(comp)
+end
+
 for _, t in ipairs({ 3.0, 5.0, 8.0, 12.0, 18.0, 26.0, 36.0 }) do
     ticker.AddTimerOnce(t, function()
         if cacheHasData() then return end
+        if not LobbyIsSettled() then return end
         pcall(tryLoad)
     end)
 end
@@ -15218,6 +15420,7 @@ if ticker.AddTimerLoop then
             if not inLobby then return end
             if cacheHasData() then return end
             if count(readDisk()) == 0 then return end
+            if not LobbyIsSettled() then return end   -- FIX: also require a live avatar component
             log("safety net: cache empty, disk populated → reload")
             pcall(tryLoad)
         end)
@@ -15967,9 +16170,16 @@ do
     installMatchHooks()
 
     -- Dedicated timer that survives Lobby -> Match transitions
+    -- FIX (lag): this used to register BOTH a Game 0.4s timer and a ticker 0.4s
+    --      loop running the same tick, so applyBagAndHelmetInMatch did double
+    --      work every 0.4s. Only one loop is created now, and the hook
+    --      re-install is skipped once the hooks are known to be in place.
     local function startBagHelmLoop()
         local function tick()
-            pcall(installLobbyHooks)
+            if not _G._BH_HooksReady then
+                pcall(installLobbyHooks)
+                _G._BH_HooksReady = true
+            end
             pcall(function()
                 local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
                         or require("GameLua.GameCore.Data.GameplayData")
@@ -15982,17 +16192,23 @@ do
             end)
         end
 
-        pcall(function()
-            if Game and Game.SetTimer and not _G._BH_GameTimer then
-                _G._BH_GameTimer = Game:SetTimer(0.4, true, tick)
-            end
-        end)
+        -- FIX: single instance, ticker preferred, Game timer only as fallback.
+        if _G._BH_TickerLoop or _G._BH_GameTimer then return end
+        local created = false
         pcall(function()
             local tk = require("common.time_ticker")
-            if tk and tk.AddTimerLoop and not _G._BH_TickerLoop then
+            if tk and tk.AddTimerLoop then
                 _G._BH_TickerLoop = tk.AddTimerLoop(0.4, tick, -1, 0.4)
+                created = true
             end
         end)
+        if not created then
+            pcall(function()
+                if Game and Game.SetTimer then
+                    _G._BH_GameTimer = Game:SetTimer(0.4, true, tick)
+                end
+            end)
+        end
     end
     startBagHelmLoop()
 end
@@ -16020,6 +16236,18 @@ local __five_ok, __five_err = pcall(function()
         _G.__STABILITY_COMBINED_V1 = true
         _G.__STABILITY_ENGINE_V1   = true   -- block standalone stability.lua
         _G.__PERF_MODE_V1          = true   -- block standalone perf_mode.lua
+
+        -- PERF-FIX: adaptive stability engine disabled.
+        -- It capped FPS (45/60/88), rewrote r.ScreenPercentage every 300 ms
+        -- and ran a 250 ms ticker -- the main source of in-game lag. Native
+        -- game settings now own FPS/resolution. Keep the guard flags above so
+        -- standalone copies stay blocked, then return without any timer.
+        _G.StabilityCombined = _G.StabilityCombined or {
+            tier = "mid", tierSource = "disabled",
+            stab = { enabled = false, touchRelief = false, thermalGuard = false },
+            perf = { enabled = false, adaptive = false, forceAggressive = false },
+        }
+        do return _G.StabilityCombined end
 
         local BASE = "/storage/emulated/0/Android/data/com.pubg.imobile/files/"
         local LOG  = BASE .. "stability.txt"
@@ -16809,11 +17037,25 @@ __defer_feature('2.lua', [===[
 -- ============================================================================
 
 -- Clean up any previous version timers if re-executed
-if _G._V6WatchdogHandle and Game and Game.ClearTimer then
-    pcall(function() Game:ClearTimer(_G._V6WatchdogHandle) end)
+-- FIX: nil the handle after clearing, otherwise the old watchdog keeps running
+--      and its handle is lost the moment the new one overwrites the global.
+if _G._V6WatchdogHandle then
+    if Game and Game.ClearTimer then
+        pcall(function() Game:ClearTimer(_G._V6WatchdogHandle) end)
+    end
+    _G._V6WatchdogHandle = nil
 end
+-- FIX: _V6FastReset is the PREVIOUS chunk's closure. It closes over the dead
+--      match's ESPEngine and would destroy already-destroyed widgets. Only run
+--      it when that engine still owns a valid canvas, then forget the closure.
 if _G._V6FastReset and type(_G._V6FastReset) == "function" then
-    pcall(_G._V6FastReset)
+    pcall(function()
+        local E = _G.ESPEngine
+        if E and E.Canvas and slua.isValid(E.Canvas) then
+            _G._V6FastReset()
+        end
+    end)
+    _G._V6FastReset = nil
 end
 
 -- ============================================================================
@@ -17440,6 +17682,48 @@ local function AimTouch()
 end
 
 -- ============================================================================
+-- PASS-2 CRASH HELPERS
+-- ============================================================================
+-- FIX (pass 2): one place that tears a UMG widget down in the only order that
+-- is safe. RemoveFromParent() MUST succeed before ConditionalBeginDestroy():
+-- destroying a widget that is still parented makes Slate free the object while
+-- its parent panel still holds the pointer, and the panel frees it again when
+-- the HUD is torn down. That second free is a native access violation -- pcall
+-- cannot catch it, which is exactly why the crash survived pass 1.
+if not _G._DetachThenDestroy then
+    function _G._DetachThenDestroy(w)
+        if w == nil then return false end
+        if not _G.SafeValid(w) then return false end
+        local ok = pcall(function() w:RemoveFromParent() end)
+        if not ok then
+            -- Still parented: its owner is responsible for it. Dropping our
+            -- reference is the only safe move.
+            return false
+        end
+        pcall(function() w:ConditionalBeginDestroy() end)
+        return true
+    end
+end
+
+-- FIX (pass 2): true only while a real match level is running. Used to stop
+-- the ESP engine from building widgets in the lobby, where the canvas it
+-- attaches to is the lobby HUD that the game destroys on match load.
+if not _G._InMatchNow then
+    function _G._InMatchNow()
+        local gs = _G.GameStatus
+        if not gs then return true end
+        if type(gs.IsInFightingStatus) == "function" then
+            local ok, r = pcall(gs.IsInFightingStatus)
+            if ok and r == false then return false end
+        end
+        if type(gs.IsInLobbyOrMainCity) == "function" then
+            local ok, r = pcall(gs.IsInLobbyOrMainCity)
+            if ok and r == true then return false end
+        end
+        return true
+    end
+end
+
 -- PART 7: PURE UMG OVERHEAD TAG + BANNER + SNAPLINES + FULL-BODY CHAMS
 -- ============================================================================
 local ESPEngine = {
@@ -17472,21 +17756,71 @@ local ESPEngine = {
     }
 }
 
+-- FIX (pass 2): ESPEngine used to be a file-local, so the re-entry guard in
+-- 2.lua (`if _G.ESPEngine then _G.ESPEngine = nil ... end`) always saw nil and
+-- silently skipped the reset. Every match therefore leaked a full set of
+-- widgets onto a canvas that the game was about to destroy.
+_G.ESPEngine = ESPEngine
+
 -- Full Reset when transitioning between matches
+-- FIX: destroys one ESP node's widgets exactly once, then drops every
+--      reference so nothing can be double-destroyed later.
+local function _DestroyESPNode(node)
+    if not node then return end
+    -- FIX (pass 2): the old code ran RemoveFromParent() and
+    -- ConditionalBeginDestroy() inside ONE pcall. If the detach threw (which it
+    -- does the moment the owning HUD is already gone) the destroy was skipped
+    -- and the widget stayed parented; if the detach half-succeeded the destroy
+    -- ran on a still-parented widget. Both paths end in a double free inside
+    -- Slate. _DetachThenDestroy() only destroys after a confirmed detach.
+    if node.Overhead then
+        _DetachThenDestroy(node.Overhead.Container)
+        node.Overhead.Container = nil
+        node.Overhead.Slot      = nil
+    end
+    if node.Snapline then
+        _DetachThenDestroy(node.Snapline.Widget)
+        node.Snapline.Widget = nil
+    end
+    node.Overhead = nil
+    node.Snapline = nil
+    node.Pawn     = nil
+end
+
+-- FIX: clears every ESP node without mutating the table during pairs().
+--      The old code did ESPEngine.Nodes[k] = nil inside pairs(), which throws
+--      "invalid key to 'next'" as soon as more than one enemy is tracked --
+--      i.e. exactly at match end. That aborted the reset halfway and left a
+--      live canvas whose owner widget the game had already destroyed.
+local function _ClearAllESPNode()
+    local keys = {}
+    for k in pairs(ESPEngine.Nodes) do keys[#keys + 1] = k end
+    for i = 1, #keys do
+        _DestroyESPNode(ESPEngine.Nodes[keys[i]])
+        ESPEngine.Nodes[keys[i]] = nil
+    end
+end
+
 local function ResetESPEngineForNewMatch()
-    for k, node in pairs(ESPEngine.Nodes) do
-        if node.Overhead and Valid(node.Overhead.Container) then
-            pcall(function() node.Overhead.Container:RemoveFromParent(); node.Overhead.Container:ConditionalBeginDestroy() end)
-        end
-        if node.Snapline and Valid(node.Snapline.Widget) then
-            pcall(function() node.Snapline.Widget:RemoveFromParent(); node.Snapline.Widget:ConditionalBeginDestroy() end)
-        end
-        ESPEngine.Nodes[k] = nil
-    end
+    _ClearAllESPNode()
+
     local B = ESPEngine.Banner
-    if Valid(B.Container) then
-        pcall(function() B.Container:RemoveFromParent(); B.Container:ConditionalBeginDestroy() end)
+    -- FIX (pass 2): park the slot off-screen first. The banner slot lives in
+    -- the canvas' slot array; while it still points at a visible position the
+    -- canvas keeps laying it out every frame, and layout on a half-destroyed
+    -- child is another native crash path.
+    if Valid(B.Slot) then
+        pcall(function() B.Slot:SetPosition(FVector2D(-10000, -10000)) end)
+        pcall(function() B.Slot:SetVisibility(UEnums.ESlateVisibility.Collapsed) end)
     end
+    -- Children of the container are destroyed with it; they are only detached
+    -- here so the container's own teardown cannot walk a dangling child list.
+    if Valid(B.TextBlock) then pcall(function() B.TextBlock:RemoveFromParent() end) end
+    if Valid(B.AccentBar) then pcall(function() B.AccentBar:RemoveFromParent() end) end
+    -- FIX (pass 2): safe detach-then-destroy. If the detach fails the widget is
+    -- still owned by a live panel, so it is left alone instead of double-freed.
+    _DetachThenDestroy(B.Container)
+
     B.Container = nil
     B.Slot = nil
     B.TextBlock = nil
@@ -17494,16 +17828,30 @@ local function ResetESPEngineForNewMatch()
     B.LastText = ""
     B.LastState = -1
     B.LastX = -9999
+    B.LastY = -9999
     ESPEngine.Canvas = nil
     ESPEngine.LastTransformTime = 0
     ESPEngine.Chams.ConsoleReady = false
+    -- FIX: clear identity here too, otherwise the next tick resets a second time.
+    ESPEngine.LastPC = nil
+    ESPEngine.LastPawn = nil
     EnemyRoster.LastSync = 0
     aimVisCache = {}
 end
 _G._V6FastReset = ResetESPEngineForNewMatch
 
 local function EnsureCanvas()
-    if Valid(ESPEngine.Canvas) then return true end
+    -- FIX (pass 2): never build ESP widgets outside a live match. In the lobby
+    -- the only canvas available is the game's own HUD canvas, which the game
+    -- destroys when the match level loads -- taking our widgets with it and
+    -- leaving every cached reference pointing into freed Slate memory.
+    if not _InMatchNow() then
+        if ESPEngine.Canvas ~= nil or next(ESPEngine.Nodes) ~= nil then
+            ResetESPEngineForNewMatch()
+        end
+        return false
+    end
+
     local InGameUITools = package.loaded["GameLua.Mod.BaseMod.Common.UI.InGameUITools"]
     if not InGameUITools then pcall(function() InGameUITools = require("GameLua.Mod.BaseMod.Common.UI.InGameUITools") end) end
     if not InGameUITools or not InGameUITools.GetMainControlBaseUI then return false end
@@ -17512,9 +17860,22 @@ local function EnsureCanvas()
     if not Valid(MainUI) then return false end
     local c = (Valid(MainUI.CanvasPanel_0) and MainUI.CanvasPanel_0) or (Valid(MainUI.CanvasPanel_42) and MainUI.CanvasPanel_42) or nil
     if not c then return false end
-    ESPEngine.Canvas = c
-    ESPEngine.LastTransformTime = 0
-    ESPEngine.Banner.LastX = -9999
+
+    -- FIX (pass 2): identity check, not just validity. slua.isValid() can still
+    -- report true for a widget the game has already queued for destruction, so
+    -- the old `if Valid(ESPEngine.Canvas) then return true end` happily reused
+    -- the dead lobby canvas. Comparing against the canvas the HUD exposes right
+    -- now catches the swap: if it changed, everything bound to the old one is
+    -- torn down before the new one is adopted.
+    if ESPEngine.Canvas ~= c then
+        if ESPEngine.Canvas ~= nil then
+            ResetESPEngineForNewMatch()
+        end
+        ESPEngine.Canvas = c
+        ESPEngine.LastTransformTime = 0
+        ESPEngine.Banner.LastX = -9999
+        ESPEngine.Banner.LastY = -9999
+    end
     return true
 end
 
@@ -17853,6 +18214,19 @@ local function RealTimeESPTick()
     if now - lastESPRender < ESP_RENDER_INTERVAL then return end
     lastESPRender = now
 
+    -- FIX (pass 2, ROOT CAUSE): hard gate on match state. Between matches this
+    -- tick used to keep running against the lobby HUD canvas while the engine
+    -- was tearing that HUD down. Every AddChildToCanvas / SetPosition on those
+    -- widgets after teardown is a native access violation. Bail out and release
+    -- everything the moment we are no longer in a match.
+    if not _InMatchNow() then
+        if ESPEngine.Canvas ~= nil or next(ESPEngine.Nodes) ~= nil
+           or ESPEngine.Banner.Container ~= nil then
+            ResetESPEngineForNewMatch()
+        end
+        return
+    end
+
     local myPlayer, pc = GetLocalPlayerAndPC()
     if not Valid(myPlayer) or not Valid(pc) then
         if ESPEngine.LastPC ~= nil then
@@ -17863,10 +18237,21 @@ local function RealTimeESPTick()
         return
     end
 
-    if ESPEngine.LastPC ~= pc or ESPEngine.LastPawn ~= myPlayer then
+    -- FIX: full teardown only on a real PC change (the actual match boundary).
+    --      The old test also fired on every pawn change -- respawn, spectate and
+    --      the waiting island -- which destroyed and rebuilt the whole canvas
+    --      while the game was tearing it down, causing a double
+    --      ConditionalBeginDestroy() inside Slate.
+    if ESPEngine.LastPC ~= pc then
         ESPEngine.LastPC = pc
         ESPEngine.LastPawn = myPlayer
         ResetESPEngineForNewMatch()
+    elseif ESPEngine.LastPawn ~= myPlayer then
+        -- Same match, new pawn: keep the canvas, drop only the per-pawn nodes.
+        ESPEngine.LastPawn = myPlayer
+        _ClearAllESPNode()
+        EnemyRoster.LastSync = 0
+        aimVisCache = {}
     end
 
     if not _G.Mod_ESP_Enabled then
@@ -18166,19 +18551,23 @@ local function RealTimeESPTick()
         end
 
         -- Clean up dead or despawned enemies
-        for k, node in pairs(ESPEngine.Nodes) do
-            if not activeKeys[k] then
+        -- FIX: collect first, delete after. Mutating during pairs() threw
+        --      "invalid key to 'next'" every time the whole enemy list
+        --      despawned at match end, aborting the tick halfway through.
+        local deadKeys = {}
+        for k in pairs(ESPEngine.Nodes) do
+            if not activeKeys[k] then deadKeys[#deadKeys + 1] = k end
+        end
+        for i = 1, #deadKeys do
+            local k = deadKeys[i]
+            local node = ESPEngine.Nodes[k]
+            if node then
                 if node.ESP5Applied and Valid(node.Pawn) and node.Pawn.Replay_SetVisiableOfFrameUI then
                     pcall(function() node.Pawn:Replay_SetVisiableOfFrameUI(false) end)
                 end
-                if node.Overhead and Valid(node.Overhead.Container) then
-                    pcall(function() node.Overhead.Container:RemoveFromParent(); node.Overhead.Container:ConditionalBeginDestroy() end)
-                end
-                if node.Snapline and Valid(node.Snapline.Widget) then
-                    pcall(function() node.Snapline.Widget:RemoveFromParent(); node.Snapline.Widget:ConditionalBeginDestroy() end)
-                end
-                ESPEngine.Nodes[k] = nil
+                _DestroyESPNode(node)
             end
+            ESPEngine.Nodes[k] = nil
         end
 
         UpdateBanner(realCount, botCount, nearestMeters == 9999 and 0 or nearestMeters, _G.Mod_ESP_ShowPlayerCount)
@@ -18189,42 +18578,113 @@ end
 -- PART 8: IMMORTAL MULTI-MATCH SCHEDULER (NEVER DIES AFTER MATCH 1!)
 -- ============================================================================
 local _AttachedTimerPC = nil
+local _AttachedTimerId = nil    -- FIX: keep the handle so it can be removed
+local _TickerRunning   = false  -- FIX: single-instance guard
 
 local function MasterFrameTick()
+    -- FIX: bail out while the world is being torn down. pcall cannot catch a
+    --      freed-object access, so the guard has to come first.
+    local myPlayer, pc = GetLocalPlayerAndPC()
+    if not Valid(pc) or not Valid(myPlayer) then return end
     pcall(AimTouch)
     pcall(RealTimeESPTick)
 end
 
 local _lastTickerHeartbeat = 0
 local function StartTickerLoop()
+    -- FIX: without this guard every stalled match transition spawned another
+    --      self-rescheduling 40 Hz chain. After 2-4 matches N chains were all
+    --      building ESP widgets -- the main crash + lag source.
+    if _TickerRunning then return end
     local t = nil
     pcall(function() t = require("common.time_ticker") end)
-    if t and t.AddTimerOnce then
-        local function step()
-            _lastTickerHeartbeat = os.clock()
-            MasterFrameTick()
-            pcall(t.AddTimerOnce, 0.025, step)
-        end
+    if not (t and t.AddTimerOnce) then return end
+    _TickerRunning = true
+    local function step()
+        _lastTickerHeartbeat = os.clock()
+        MasterFrameTick()
+        if not _TickerRunning then return end
         pcall(t.AddTimerOnce, 0.025, step)
     end
+    pcall(t.AddTimerOnce, 0.025, step)
 end
 StartTickerLoop()
 
+-- FIX (pass 2): common.time_ticker is shared by ~28 looping registrations in
+-- this bundle. A single unguarded error inside one callback propagates into the
+-- engine's timer pump, which aborts the pump mid-frame and leaves the UI half
+-- torn down -- the next transition then walks that broken state and crashes.
+-- Wrapping each callback keeps the pump alive and records the error instead.
+function _G.__HardenTicker()
+    local ok, tk = pcall(require, "common.time_ticker")
+    if not ok or type(tk) ~= "table" then return false end
+    if tk.__hardened then return true end
+
+    local function wrap(fn)
+        if type(fn) ~= "function" then return fn end
+        return function(...)
+            local okc, r = pcall(fn, ...)
+            if not okc then
+                _G.__last_timer_error = tostring(r)
+                return nil
+            end
+            return r
+        end
+    end
+
+    local origLoop = tk.AddTimerLoop
+    local origOnce = tk.AddTimerOnce
+    if type(origLoop) == "function" then
+        tk.AddTimerLoop = function(interval, fn, ...)
+            return origLoop(interval, wrap(fn), ...)
+        end
+    end
+    if type(origOnce) == "function" then
+        tk.AddTimerOnce = function(delay, fn, ...)
+            return origOnce(delay, wrap(fn), ...)
+        end
+    end
+    tk.__hardened = true
+    return true
+end
+pcall(_G.__HardenTicker)
+
 local function MultiMatchWatchdog()
     pcall(function()
+        -- FIX (pass 2): the ticker module may not have been loaded yet when the
+        -- hardening ran above. Retry until it takes.
+        if not (_G.__TickerHardened) then
+            if _G.__HardenTicker() then _G.__TickerHardened = true end
+        end
+
         local now = os.clock()
         if now - _lastTickerHeartbeat > 0.5 then
             StartTickerLoop()
         end
 
         local _, pc = GetLocalPlayerAndPC()
+
+        -- FIX: when the PC we attached to is destroyed, drop the reference AND
+        --      remove its game timer. Previously the dead PC was kept forever
+        --      and its AddGameTimer closure kept firing on a freed controller.
+        if _AttachedTimerPC and not Valid(_AttachedTimerPC) then
+            if _AttachedTimerId and _AttachedTimerPC.RemoveGameTimer then
+                pcall(function() _AttachedTimerPC:RemoveGameTimer(_AttachedTimerId) end)
+            end
+            _AttachedTimerPC = nil
+            _AttachedTimerId = nil
+        end
+
         if Valid(pc) and _AttachedTimerPC ~= pc and pc.AddGameTimer then
             _AttachedTimerPC = pc
-            pc:AddGameTimer(0.030, true, function()
-                if os.clock() - _lastTickerHeartbeat > 0.15 then
-                    MasterFrameTick()
-                end
+            local ok, id = pcall(function()
+                return pc:AddGameTimer(0.030, true, function()
+                    if os.clock() - _lastTickerHeartbeat > 0.15 then
+                        MasterFrameTick()
+                    end
+                end)
             end)
+            _AttachedTimerId = ok and id or nil
         end
     end)
 end
@@ -18401,7 +18861,8 @@ end
 
 pcall(_G.InitMasterMenusV6)
 if Game and Game.SetTimer then
-    Game:SetTimer(2.0, false, function() pcall(_G.InitMasterMenusV6) end)
+    -- FIX: guarded; this ran during the handoff when Game was nil.
+SafeSetTimer(2.0, false, function() pcall(_G.InitMasterMenusV6) end)
 end
 
 print("[VIP STANDALONE V6.1] Loaded — Full Aimbot Sliders + Green/Red Chams + Multi-Match V6 Engine")
@@ -18412,147 +18873,9 @@ print("[VIP STANDALONE V6.1] Loaded — Full Aimbot Sliders + Green/Red Chams + 
 -- 3. 3.lua
 -- ============================================================================
 __defer_feature('3.lua', [===[
--- 165 FPS Unlock (FPS only)
-
-local KismetMathLibrary_1 = import("KismetMathLibrary")
-
-local logic_setting_graphics_1 = package.loaded["client.slua.logic.setting.logic_setting_graphics"] or require("client.slua.logic.setting.logic_setting_graphics")
-local GSC_FPS_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPS"] or require("client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPS")
-local GSC_FPSFT_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPSFT"] or require("client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPSFT")
-local GraphicSettingDB_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.GraphicSettingDB"] or require("client.slua.umg.NewSetting.GraphicsNew.GraphicSettingDB")
-
-if logic_setting_graphics_1 then
-    local var_132 = logic_setting_graphics_1.SetFPS
-    function logic_setting_graphics_1.SetFPS(gameInstance, FPSLevel)
-        if FPSLevel == 8 and GraphicSettingDB_1 then
-            local var_234 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
-            if not var_234 then
-                GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneSwitch, true)
-            end
-        end
-        if var_132 then
-            var_132(gameInstance, FPSLevel)
-        end
-        if FPSLevel == 8 and GraphicSettingDB_1 then
-            GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneNum, 165)
-            gameInstance:ExecuteCMD("t.MaxFPS", "165")
-            gameInstance:ExecuteCMD("r.FrameRateLimit", "165")
-        end
-    end
-end
-
-if GSC_FPS_1 and GSC_FPS_1.__inner_impl then
-    local var_160 = GSC_FPS_1.__inner_impl
-    function var_160:GetMaxFPSLevel() return 8, 8 end
-    function var_160:CanChangeQualityAndFPSPreCheck() return true end
-    function var_160:InitRealSupportFPS()
-        local var_29 = {}
-        for i = 1, 8 do var_29[i] = {true, true} end
-        if GraphicSettingDB_1 then GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.RealSupportFPS, var_29, false) end
-        return var_29
-    end
-    function var_160:SetFPSAndQualityEnable(bEnable)
-        if self.UIRoot and self.UIRoot.Image_Mask then self:SetWidgetVisible(self.UIRoot.Image_Mask, false) end
-    end
-    function var_160:UpdateSelectedFPSState(selectedLevel)
-        local var_37 = { [2]="NodeFps20", [3]="NodeFps25", [4]="NodeFps30", [5]="NodeFps40", [6]="NodeFps60", [7]="NodeFps90", [8]="NodeFps120" }
-        if not self.UIRoot then return end
-        for level, name in pairs(var_37) do
-            if self.UIRoot[name] then
-                self:WidgetSelfHit(self.UIRoot[name])
-                self.UIRoot[name]:SetIsEnabled(true)
-                local var_54 = self.UIRoot["WidgetSwitcher_" .. level]
-                if var_54 then var_54:SetActiveWidgetIndex(level == selectedLevel and 0 or 1) end
-            end
-        end
-    end
-    local var_58 = var_160.UpdateUI
-    function var_160:UpdateUI()
-        if var_58 then pcall(var_58, self) end
-        self:SelfHitTestInvisible()
-        self:InitRealSupportFPS()
-        self:SetFPSAndQualityEnable(true)
-        local var_222 = 8
-        if GraphicSettingDB_1 then
-            if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.CustomTab) == 2 then
-                var_222 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.LobbyFPS) or 8
-            else
-                var_222 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.SelectedFPS) or 8
-            end
-        end
-        self:UpdateSelectedFPSState(var_222)
-    end
-    function var_160:DoClickFPS(FPSLevel)
-        if slua.isValid(self.UIRoot) then
-            if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.CustomTab) == 2 then
-                GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.LobbyFPS, FPSLevel)
-            else
-                GraphicSettingDB_1:UpdateSelectedFPS(FPSLevel)
-            end
-            self:UpdateSelectedFPSState(FPSLevel)
-            if self:GetParentUI() then
-                self:GetParentUI():SaveQualityAndFPS()
-                self:GetParentUI():SetDirty(true)
-            end
-        end
-    end
-end
-
-if GSC_FPSFT_1 and GSC_FPSFT_1.__inner_impl then
-    local var_13 = GSC_FPSFT_1.__inner_impl
-    local var_93, var_203 = 90, 5
-    local function func_6(val, min, max) return val < min and min or (val > max and max or val) end
-    function var_13:ShowOrHide()
-        self:SelfHitTestInvisible()
-        if self.InitFPSFTSwitch then self:InitFPSFTSwitch() end
-    end
-    function var_13:InitFPSFTSwitch()
-        local sw = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
-        if self.UIRoot.Setting_Switch then self.UIRoot.Setting_Switch:SetSwitcherEnable2(sw, true) end
-        if self.UIRoot.CanvasPanel_8 then self:SetWidgetVisible(self.UIRoot.CanvasPanel_8, sw) end
-        if self.UIRoot.WidgetSwitcher_0 then self.UIRoot.WidgetSwitcher_0:SetActiveWidgetIndex(2) end
-        if self.InitFPSFTValue165 then self:InitFPSFTValue165() end
-    end
-    function var_13:InitFPSFTValue165()
-        local var_202 = self.UIRoot
-        local sw = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
-        local var_69 = sw and GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum) or 165
-        var_202.Slider_screen3:SetLocked(not sw)
-        var_202.ProgressBar_screen3:SetFillColorAndOpacity(sw and FLinearColor(1,1,1,1) or FLinearColor(1,0.625,0.6,1))
-        local var_60 = (var_69 - var_93) / (165 - var_93)
-        var_202.Veihclescreen3:SetText(LocUtil.LocalizeResFormat(10567, var_69))
-        var_202.Slider_screen3:SetValue(var_60)
-        var_202.ProgressBar_screen3:SetPercent(var_60)
-    end
-    function var_13:OnFPSFTValueChange3(var_69)
-        GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneNum, var_69)
-        self:InitFPSFTValue165()
-        if self:GetParentUI() then self:GetParentUI():SetDirty(true) end
-        local var_43 = GraphicSettingDB_1.GetGameInstance and GraphicSettingDB_1.GetGameInstance()
-        if var_43 then
-            var_43:ExecuteCMD("t.MaxFPS", tostring(var_69))
-            var_43:ExecuteCMD("r.FrameRateLimit", tostring(var_69))
-        end
-    end
-    function var_13:OnFPSFTSliderValueChange3(var_174)
-        if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch) then
-            local var_69 = KismetMathLibrary_1.FCeil(var_174 * (165 - var_93) / var_203) * var_203 + var_93
-            self:OnFPSFTValueChange3(func_6(var_69, var_93, 165))
-        end
-    end
-    function var_13:OnFPSFTAdd3()
-        local var_69 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum)
-        if var_69 then self:OnFPSFTValueChange3(math.min(165, var_69 + var_203)) end
-    end
-    function var_13:OnFPSFTMinus3()
-        local var_69 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum)
-        if var_69 then self:OnFPSFTValueChange3(math.max(var_93, var_69 - var_203)) end
-    end
-    var_13.OnFPSFTAdd = var_13.OnFPSFTAdd3
-    var_13.OnFPSFTMinus = var_13.OnFPSFTMinus3
-    var_13.OnFPSFTSliderValueChange = var_13.OnFPSFTSliderValueChange3
-end
-
+-- 165 FPS unlock / limiter removed for performance and stability.
+-- The native graphics settings now own FPS; no forced t.MaxFPS or
+-- r.FrameRateLimit overrides are installed.
 ]===])
 
 -- ============================================================================
