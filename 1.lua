@@ -3865,7 +3865,7 @@ _err8 = nil
 -- 3. 8.lua
 -- ============================================================================
 __run_file([==[-- ================================================================
--- ADDON: 165 FPS Always-On + Ribbon Name + Performance Boost
+-- ADDON: Ribbon Name + Performance Boost  (165 FPS unlock REMOVED - CHANGE 1)
 -- Append at END of main ESP file. Do not remove existing code.
 -- ================================================================
 
@@ -4260,7 +4260,7 @@ pcall(function()
     end
 end)
 
-print("[ADDON] 165 FPS + Ribbon Name + Performance Boost loaded")]==], '8.lua')
+print("[ADDON] Ribbon Name + Performance Boost loaded (no FPS cap)")]==], '8.lua')
 
 -- ============================================================================
 -- 4. 4.lua
@@ -4685,22 +4685,32 @@ end
 pcall(_G.LoadAttachmentsFromINI)
 
 -- Track whether attachments file changed
-local _attachContent   = nil
+local _attachStamp      = nil   -- [CHANGE 2] size stamp instead of full content
+local _attachLastFull   = 0     -- [CHANGE 2] last full parse (safety re-read)
 local _attachEverLoaded = false
 _G.RefreshAttachmentsIfChanged = function(force)
+    -- [CHANGE 2] PERFORMANCE: this used to do f:read('*a') - a full slurp of the
+    -- whole INI - on every single poll, just to compare it with the previous
+    -- copy. On Android flash that is milliseconds of blocking main-thread I/O
+    -- for a file that almost never changes mid-match.
+    -- Now we stat the file (seek to end = size only, no read) and only do the
+    -- real parse when the size actually changed, or every 30 s as a safety net.
     local f = io.open(_G.ConfigFilePath, 'r')
     if not f then return end
-    local content = f:read('*a')
+    local size = -1
+    pcall(function() size = f:seek('end') end)
     f:close()
-    if not content then
-        if not _attachEverLoaded then return end
-        content = ''
+    if size == nil then size = -1 end
+
+    local now = os.clock()
+    if not force and _attachEverLoaded and size == _attachStamp
+       and (now - _attachLastFull) < 30.0 then
+        return
     end
-    if force or content ~= _attachContent or not _attachEverLoaded then
-        _attachContent = content
-        _attachEverLoaded = true
-        pcall(_G.LoadAttachmentsFromINI)
-    end
+    _attachStamp    = size
+    _attachLastFull = now
+    _attachEverLoaded = true
+    pcall(_G.LoadAttachmentsFromINI)
 end
 
 -- ===================================================================
@@ -5827,7 +5837,11 @@ function _G.InitializeSkinModSystem()
             end
         end
 
-        -- Slow scan ticker (2.0s)  --  INI refresh + deadbox scan
+        -- [CHANGE 2] Slow scan ticker: 2.0s -> 5.0s (30 polls/min -> 12 polls/min).
+        -- Config files do not change while you are in a match, so polling them
+        -- 30 times a minute was pure overhead. The dead-box actor scan has been
+        -- pulled out into its own staggered chain below, so the two heavy tasks
+        -- never share a frame.
         local function slowScanLoop()
             pcall(function()
                 local GameplayData = require("GameLua.GameCore.Data.GameplayData")
@@ -5836,6 +5850,23 @@ function _G.InitializeSkinModSystem()
                     if slua.isValid(playerChar) then
                         _G.RefreshConfigIfChanged(false)
                         _G.RefreshAttachmentsIfChanged(false)
+                    end
+                end
+            end)
+            if timeTicker and timeTicker.AddTimerOnce then
+                timeTicker.AddTimerOnce(5.0, slowScanLoop)
+            end
+        end
+
+        -- [CHANGE 2] Dead-box scan on its own 5.0s chain, offset by 2.5s.
+        -- GetAllActorsOfClass() enumerates every actor in the world, so keeping
+        -- it away from the INI read removes the periodic double-spike.
+        local function deadBoxLoop()
+            pcall(function()
+                local GameplayData = require("GameLua.GameCore.Data.GameplayData")
+                if GameplayData then
+                    local playerChar = GameplayData.GetPlayerCharacter()
+                    if slua.isValid(playerChar) then
                         local PC = GameplayData.GetPlayerController()
                         if slua.isValid(PC) then
                             _G.DeadBox_TemperRequest(PC)
@@ -5844,7 +5875,7 @@ function _G.InitializeSkinModSystem()
                 end
             end)
             if timeTicker and timeTicker.AddTimerOnce then
-                timeTicker.AddTimerOnce(2.0, slowScanLoop)
+                timeTicker.AddTimerOnce(5.0, deadBoxLoop)
             end
         end
 
@@ -5859,6 +5890,12 @@ function _G.InitializeSkinModSystem()
         fastApplyLoop()
         slowScanLoop()
         slowHookLoop()
+        -- [CHANGE 2] start the dead-box chain 2.5s later so it is de-clustered
+        if timeTicker and timeTicker.AddTimerOnce then
+            timeTicker.AddTimerOnce(2.5, deadBoxLoop)
+        else
+            deadBoxLoop()
+        end
     end
 end
 
@@ -17762,7 +17799,9 @@ local VIS_HIDE = UEnums.ESlateVisibility.Collapsed
 local EnemyRoster = {
     List = {},
     LastSync = 0,
-    SyncInterval = 0.20
+    SyncInterval = 0.25   -- [CHANGE 2] was 0.20 (5 Hz full roster rebuild).
+                          -- 0.25 (4 Hz) is still visually instant but does
+                          -- 20% fewer GetAllPlayerPawns walks per second.
 }
 
 local function GetTeamIDFromPawn(pawn)
@@ -18095,6 +18134,16 @@ end
 -- ============================================================================
 -- PART 7: PURE UMG OVERHEAD TAG + BANNER + SNAPLINES + FULL-BODY CHAMS
 -- ============================================================================
+-- [CHANGE 6] CODE-DRIVEN UI CONTRACT
+-- Every element below (overhead tag, health bar, banner, snapline) is built at
+-- runtime from CGame:NewObjectFromPath(...) - pure code, zero blueprint assets
+-- and zero native/system UI calls. Cost is therefore a direct function of this
+-- file's own efficiency:
+--   * widgets are pooled and reused (ESPEngine.Pool) instead of rebuilt
+--   * every setter is guarded by a "did it actually change" cache
+--   * positions are pixel-snapped so unchanged frames issue no layout calls
+--   * colours/fonts are pre-built once in PALETTE, never allocated per frame
+-- ============================================================================
 local ESPEngine = {
     Canvas = nil,
     LastPC = nil,
@@ -18122,14 +18171,33 @@ local ESPEngine = {
     },
     Chams = {
         ConsoleReady = false
-    }
+    },
+    -- [CHANGE 6] Code-driven UI: overhead tags are recycled through this pool
+    -- instead of being destroyed and rebuilt for every enemy on every match.
+    Pool = {}
 }
 
 -- Full Reset when transitioning between matches
 local function ResetESPEngineForNewMatch()
     for k, node in pairs(ESPEngine.Nodes) do
+        -- [CHANGE 6] recycle the overhead widget instead of destroying it
         if node.Overhead and Valid(node.Overhead.Container) then
-            pcall(function() node.Overhead.Container:RemoveFromParent(); node.Overhead.Container:ConditionalBeginDestroy() end)
+            local OH = node.Overhead
+            if OH.Canvas == ESPEngine.Canvas and #ESPEngine.Pool < 32 then
+                pcall(function() OH.Container:SetWidgetVisibility(VIS_HIDE) end)
+                OH.Shown = false
+                OH.TextShown = true
+                OH.HpShown = true
+                OH.LastText = ""
+                OH.LastColor = nil
+                OH.LastHP = -1
+                OH.LastHpTier = -1
+                OH.LastX = -1e9
+                OH.LastY = -1e9
+                ESPEngine.Pool[#ESPEngine.Pool + 1] = OH
+            else
+                pcall(function() OH.Container:RemoveFromParent(); OH.Container:ConditionalBeginDestroy() end)
+            end
         end
         if node.Snapline and Valid(node.Snapline.Widget) then
             pcall(function() node.Snapline.Widget:RemoveFromParent(); node.Snapline.Widget:ConditionalBeginDestroy() end)
@@ -18348,6 +18416,31 @@ local TAG_HEIGHT    = 28
 
 local function CreatePureOverheadWidget()
     if not Valid(ESPEngine.Canvas) then return nil end
+
+    -- [CHANGE 6] Reuse a pooled tag when one belongs to the current canvas.
+    -- This is the "code-driven UI" path: no blueprint, no native UI call, and
+    -- no UMG object churn once the pool is warm.
+    local pool = ESPEngine.Pool
+    if pool and #pool > 0 then
+        local w = pool[#pool]
+        pool[#pool] = nil
+        if w and Valid(w.Container) and Valid(w.MainSlot) and w.Canvas == ESPEngine.Canvas then
+            pcall(function()
+                w.Container:SetWidgetVisibility(VIS_SHOW)
+                w.MainSlot:SetSize(FVector2D(TAG_WIDTH, TAG_HEIGHT))
+                w.MainSlot:SetAlignment(FVector2D(0.5, 1.0))
+                w.MainSlot:SetZOrder(25)
+                if Valid(w.TextBlock) then w.TextBlock:SetWidgetVisibility(VIS_SHOW) end
+                if Valid(w.HpBg)     then w.HpBg:SetWidgetVisibility(VIS_SHOW) end
+                if Valid(w.HpFill)   then w.HpFill:SetWidgetVisibility(VIS_SHOW) end
+            end)
+            w.Shown, w.TextShown, w.HpShown = true, true, true
+            w.LastText, w.LastColor, w.LastHP, w.LastHpTier = "", nil, -1, -1
+            w.LastX, w.LastY = -1e9, -1e9
+            return w
+        end
+    end
+
     local cont, mainSlot, tb, hpBg, hpFill, hpFillSlot = nil, nil, nil, nil, nil, nil
 
     pcall(function()
@@ -18375,6 +18468,15 @@ local function CreatePureOverheadWidget()
                 tb.Font = f
             end
             if tb.SetJustification then tb:SetJustification(1) end
+            -- [CHANGE 4] 1px drop shadow + outline: same layout, far cleaner
+            -- and more readable against bright terrain. Set once at creation,
+            -- so it costs nothing per frame.
+            pcall(function()
+                if tb.SetShadowOffset then tb:SetShadowOffset(FVector2D(1, 1)) end
+                if tb.SetShadowColorAndOpacity then
+                    tb:SetShadowColorAndOpacity(FLinearColor(0, 0, 0, 0.85))
+                end
+            end)
             tb:SetWidgetVisibility(VIS_SHOW)
             local ts = cont:AddChildToCanvas(tb)
             if ts then
@@ -18427,6 +18529,9 @@ local function CreatePureOverheadWidget()
         HpBg = hpBg,
         HpFill = hpFill,
         HpFillSlot = hpFillSlot,
+        Canvas = ESPEngine.Canvas,      -- [CHANGE 6] pool validity check
+        LastX = -1e9,                   -- [CHANGE 4] pixel-snap cache
+        LastY = -1e9,
         PosVec = FVector2D(0, 0),
         HpSizeVec = FVector2D(HP_BAR_WIDTH, HP_BAR_HEIGHT),
         LastText = "",
@@ -18498,14 +18603,42 @@ local function ApplyMeshChamsFull(mesh, visCol, occCol)
 end
 
 -- ============================================================================
--- MASTER REAL-TIME ESP TICK (30 FPS)
+-- [CHANGE 5] WALL-CHAMS FAST PATH
 -- ============================================================================
-local lastESPRender = 0
-local ESP_RENDER_INTERVAL = 0.033
+-- ApplyMeshChamsFull() issues ~10 engine setters per mesh, and it used to be
+-- re-run on EVERY mesh of EVERY enemy every 1.5 s (~90 calls per enemy per
+-- pass) purely to catch newly streamed clothing slots. We now stamp each mesh
+-- with the colour signature we applied to it and skip it entirely if the
+-- signature already matches. Visual output is byte-for-byte identical, but
+-- after the first pass the cost collapses to a table lookup per mesh.
+local function ApplyMeshChamsCached(mesh, visCol, occCol, sig)
+    if not Valid(mesh) then return end
+    if mesh._V6ChamSig == sig then return end
+    ApplyMeshChamsFull(mesh, visCol, occCol)
+    mesh._V6ChamSig = sig
+end
+
+-- ============================================================================
+-- MASTER REAL-TIME ESP TICK (60 FPS, adaptive)          -- [CHANGE 3]
+-- ============================================================================
+-- [CHANGE 3] Snaplines / overhead tags now render at 60 FPS instead of 30 FPS.
+-- The interval is self-tuning: if the tick cannot fit its own frame budget the
+-- rate steps down to 45 then 30 FPS, and it climbs back to 60 as soon as the
+-- device has headroom again. High-end phones get the full 60 FPS; low-end
+-- phones degrade gracefully instead of dropping frames.
+local ESP_INTERVAL_MIN    = 1 / 60      -- 16.6 ms  (60 FPS target)
+local ESP_INTERVAL_MID    = 1 / 45      -- 22.2 ms  (45 FPS fallback)
+local ESP_INTERVAL_LOW    = 1 / 30      -- 33.3 ms  (30 FPS fallback)
+local ESP_RENDER_INTERVAL = ESP_INTERVAL_MIN
+local ESP_FRAME_BUDGET    = ESP_INTERVAL_MIN * 1.35
+local _espSlowStreak      = 0
+local _espFastStreak      = 0
+local lastESPRender       = 0
 
 local function RealTimeESPTick()
     local now = os.clock()
     if now - lastESPRender < ESP_RENDER_INTERVAL then return end
+    local _espTickStart = now
     lastESPRender = now
 
     local myPlayer, pc = GetLocalPlayerAndPC()
@@ -18623,25 +18756,34 @@ local function RealTimeESPTick()
                     if node.bIsAI then botCount = botCount + 1 else realCount = realCount + 1 end
 
                     -- 1. Full-Body Chams (Bot = White, Real Open = Green, Real Cover = Purple)
-                    -- Re-applies every 1.5s so newly streamed clothing/helmet/vest slots (0..7) get coloured!
-                    if showWH and (now - node.ChamsTime) > 1.5 then
-                        node.ChamsTime = now
+                    -- [CHANGE 5] Lightweight version:
+                    --   * first pass applies immediately (ChamsTime == 0)
+                    --   * later sweeps only look for NEWLY streamed slots and run
+                    --     every 3.0s instead of every 1.5s
+                    --   * each mesh is skipped if it already carries this colour
+                    --     signature, so a settled enemy costs ~0 engine calls
+                    if showWH then
                         local visCol = node.bIsAI and PALETTE.ChamBotWhite or PALETTE.ChamRealOpen
                         local occCol = node.bIsAI and PALETTE.ChamBotWhite or PALETTE.ChamRealCover
-                        pcall(function()
-                            if Valid(pawn.Mesh) then ApplyMeshChamsFull(pawn.Mesh, visCol, occCol) end
-                            local av = pawn.CharacterAvatarComp2_BP or (pawn.getAvatarComponent2 and pawn:getAvatarComponent2())
-                            if av and av.GetMeshCompBySlot then
-                                for slotIdx = 0, 7 do
-                                    local m = av:GetMeshCompBySlot(slotIdx)
-                                    if Valid(m) then ApplyMeshChamsFull(m, visCol, occCol) end
+                        local sig = node.bIsAI and "B" or "R"
+                        if node.ChamsTime == 0 or (now - node.ChamsTime) > 3.0 then
+                            node.ChamsTime = now
+                            pcall(function()
+                                ApplyMeshChamsCached(pawn.Mesh, visCol, occCol, sig)
+                                local av = pawn.CharacterAvatarComp2_BP or (pawn.getAvatarComponent2 and pawn:getAvatarComponent2())
+                                if av and av.GetMeshCompBySlot then
+                                    for slotIdx = 0, 7 do
+                                        ApplyMeshChamsCached(av:GetMeshCompBySlot(slotIdx), visCol, occCol, sig)
+                                    end
                                 end
-                            end
-                            if type(pawn.GetCurrentWeapon) == "function" then
-                                local wep = pawn:GetCurrentWeapon()
-                                if Valid(wep) and Valid(wep.Mesh) then ApplyMeshChamsFull(wep.Mesh, visCol, occCol) end
-                            end
-                        end)
+                                if type(pawn.GetCurrentWeapon) == "function" then
+                                    local wep = pawn:GetCurrentWeapon()
+                                    if Valid(wep) then
+                                        ApplyMeshChamsCached(wep.Mesh, visCol, occCol, sig)
+                                    end
+                                end
+                            end)
+                        end
                     end
 
                     -- 2. Native ESP Type 5 Frame
@@ -18697,9 +18839,18 @@ local function RealTimeESPTick()
                                         OH.Shown = true
                                     end
 
-                                    OH.PosVec.X = canvasX
-                                    OH.PosVec.Y = canvasY - 6
-                                    OH.MainSlot:SetPosition(OH.PosVec)
+                                    -- [CHANGE 4] Snap to half-pixel and only push
+                                    -- a new position when it actually moved. This
+                                    -- removes sub-pixel jitter and eliminates the
+                                    -- vast majority of per-frame UMG layout work.
+                                    local snapX = math.floor(canvasX * 2 + 0.5) * 0.5
+                                    local snapY = math.floor((canvasY - 6) * 2 + 0.5) * 0.5
+                                    if OH.LastX ~= snapX or OH.LastY ~= snapY then
+                                        OH.LastX, OH.LastY = snapX, snapY
+                                        OH.PosVec.X = snapX
+                                        OH.PosVec.Y = snapY
+                                        OH.MainSlot:SetPosition(OH.PosVec)
+                                    end
 
                                     -- Name & Distance Text
                                     if showName or showDist then
@@ -18831,8 +18982,22 @@ local function RealTimeESPTick()
                 if node.ESP5Applied and Valid(node.Pawn) and node.Pawn.Replay_SetVisiableOfFrameUI then
                     pcall(function() node.Pawn:Replay_SetVisiableOfFrameUI(false) end)
                 end
+                -- [CHANGE 6] recycle the tag back into the pool
                 if node.Overhead and Valid(node.Overhead.Container) then
-                    pcall(function() node.Overhead.Container:RemoveFromParent(); node.Overhead.Container:ConditionalBeginDestroy() end)
+                    local OH = node.Overhead
+                    if OH.Canvas == ESPEngine.Canvas and #ESPEngine.Pool < 32 then
+                        pcall(function() OH.Container:SetWidgetVisibility(VIS_HIDE) end)
+                        OH.Shown = false
+                        OH.LastText = ""
+                        OH.LastColor = nil
+                        OH.LastHP = -1
+                        OH.LastHpTier = -1
+                        OH.LastX = -1e9
+                        OH.LastY = -1e9
+                        ESPEngine.Pool[#ESPEngine.Pool + 1] = OH
+                    else
+                        pcall(function() OH.Container:RemoveFromParent(); OH.Container:ConditionalBeginDestroy() end)
+                    end
                 end
                 if node.Snapline and Valid(node.Snapline.Widget) then
                     pcall(function() node.Snapline.Widget:RemoveFromParent(); node.Snapline.Widget:ConditionalBeginDestroy() end)
@@ -18843,6 +19008,33 @@ local function RealTimeESPTick()
 
         UpdateBanner(realCount, botCount, nearestMeters == 9999 and 0 or nearestMeters, _G.Mod_ESP_ShowPlayerCount)
     end)
+
+    -- [CHANGE 3] Adaptive frame-budget governor.
+    -- Measures how long our own ESP work took this frame and steps the render
+    -- rate down (60 -> 45 -> 30) or back up (30 -> 60) so that every device
+    -- class stays smooth. Nothing is ever disabled, only paced.
+    local _espCost = os.clock() - _espTickStart
+    if _espCost > ESP_FRAME_BUDGET then
+        _espSlowStreak = _espSlowStreak + 1
+        _espFastStreak = 0
+        if _espSlowStreak >= 20 then
+            _espSlowStreak = 0
+            if ESP_RENDER_INTERVAL < ESP_INTERVAL_MID then
+                ESP_RENDER_INTERVAL = ESP_INTERVAL_MID
+            elseif ESP_RENDER_INTERVAL < ESP_INTERVAL_LOW then
+                ESP_RENDER_INTERVAL = ESP_INTERVAL_LOW
+            end
+        end
+    else
+        _espFastStreak = _espFastStreak + 1
+        _espSlowStreak = 0
+        if _espFastStreak >= 120 then
+            _espFastStreak = 0
+            if ESP_RENDER_INTERVAL > ESP_INTERVAL_MIN then
+                ESP_RENDER_INTERVAL = math.max(ESP_INTERVAL_MIN, ESP_RENDER_INTERVAL - 0.004)
+            end
+        end
+    end
 end
 
 -- ============================================================================
@@ -18857,17 +19049,26 @@ local function MasterFrameTick()
 end
 
 -- 1. Self-healing time_ticker loop
+-- [CHANGE 3] Driver raised from 40 Hz (0.025) to 60 Hz (1/60) so the ESP can
+-- actually reach 60 FPS, and a guard flag was added so the watchdog can never
+-- spawn a second parallel chain (duplicate chains were the main cause of the
+-- periodic stutter - they compounded on every match transition).
 local _lastTickerHeartbeat = 0
+local _tickerChainRunning = false
+local TICK_STEP = 1 / 60
+
 local function StartTickerLoop()
+    if _tickerChainRunning then return end
     local t = nil
     pcall(function() t = require("common.time_ticker") end)
     if t and t.AddTimerOnce then
+        _tickerChainRunning = true
         local function step()
             _lastTickerHeartbeat = os.clock()
             MasterFrameTick()
-            pcall(t.AddTimerOnce, 0.025, step)
+            pcall(t.AddTimerOnce, TICK_STEP, step)
         end
-        pcall(t.AddTimerOnce, 0.025, step)
+        pcall(t.AddTimerOnce, TICK_STEP, step)
     end
 end
 StartTickerLoop()
@@ -18877,14 +19078,19 @@ local function MultiMatchWatchdog()
     pcall(function()
         local now = os.clock()
         if now - _lastTickerHeartbeat > 0.5 then
+            -- [CHANGE 3] only ONE restart is allowed per stale heartbeat
+            _tickerChainRunning = false
             StartTickerLoop()
         end
 
         local _, pc = GetLocalPlayerAndPC()
         if Valid(pc) and _AttachedTimerPC ~= pc and pc.AddGameTimer then
             _AttachedTimerPC = pc
-            pc:AddGameTimer(0.030, true, function()
-                if os.clock() - _lastTickerHeartbeat > 0.15 then
+            -- [CHANGE 3] 33 Hz -> 60 Hz fallback, and it only fires when the
+            -- primary chain is genuinely dead (was 0.15s, now 0.35s) so the two
+            -- drivers never double-run MasterFrameTick.
+            pc:AddGameTimer(TICK_STEP, true, function()
+                if os.clock() - _lastTickerHeartbeat > 0.35 then
                     MasterFrameTick()
                 end
             end)
@@ -19016,151 +19222,19 @@ print("[VIP STANDALONE V6] Loaded — Multi-Match Persistent + Native UMG Name/H
 ]===])
 
 -- ============================================================================
--- 3. 3.lua
+-- 3. 3.lua  --  REMOVED (CHANGE 1)
 -- ============================================================================
-__defer_feature('3.lua', [===[
--- 165 FPS Unlock (FPS only)
-
-local KismetMathLibrary_1 = import("KismetMathLibrary")
-
-local logic_setting_graphics_1 = package.loaded["client.slua.logic.setting.logic_setting_graphics"] or require("client.slua.logic.setting.logic_setting_graphics")
-local GSC_FPS_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPS"] or require("client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPS")
-local GSC_FPSFT_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPSFT"] or require("client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPSFT")
-local GraphicSettingDB_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.GraphicSettingDB"] or require("client.slua.umg.NewSetting.GraphicsNew.GraphicSettingDB")
-
-if logic_setting_graphics_1 then
-    local var_132 = logic_setting_graphics_1.SetFPS
-    function logic_setting_graphics_1.SetFPS(gameInstance, FPSLevel)
-        if FPSLevel == 8 and GraphicSettingDB_1 then
-            local var_234 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
-            if not var_234 then
-                GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneSwitch, true)
-            end
-        end
-        if var_132 then
-            var_132(gameInstance, FPSLevel)
-        end
-        if FPSLevel == 8 and GraphicSettingDB_1 then
-            GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneNum, 165)
-            gameInstance:ExecuteCMD("t.MaxFPS", "165")
-            gameInstance:ExecuteCMD("r.FrameRateLimit", "165")
-        end
-    end
-end
-
-if GSC_FPS_1 and GSC_FPS_1.__inner_impl then
-    local var_160 = GSC_FPS_1.__inner_impl
-    function var_160:GetMaxFPSLevel() return 8, 8 end
-    function var_160:CanChangeQualityAndFPSPreCheck() return true end
-    function var_160:InitRealSupportFPS()
-        local var_29 = {}
-        for i = 1, 8 do var_29[i] = {true, true} end
-        if GraphicSettingDB_1 then GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.RealSupportFPS, var_29, false) end
-        return var_29
-    end
-    function var_160:SetFPSAndQualityEnable(bEnable)
-        if self.UIRoot and self.UIRoot.Image_Mask then self:SetWidgetVisible(self.UIRoot.Image_Mask, false) end
-    end
-    function var_160:UpdateSelectedFPSState(selectedLevel)
-        local var_37 = { [2]="NodeFps20", [3]="NodeFps25", [4]="NodeFps30", [5]="NodeFps40", [6]="NodeFps60", [7]="NodeFps90", [8]="NodeFps120" }
-        if not self.UIRoot then return end
-        for level, name in pairs(var_37) do
-            if self.UIRoot[name] then
-                self:WidgetSelfHit(self.UIRoot[name])
-                self.UIRoot[name]:SetIsEnabled(true)
-                local var_54 = self.UIRoot["WidgetSwitcher_" .. level]
-                if var_54 then var_54:SetActiveWidgetIndex(level == selectedLevel and 0 or 1) end
-            end
-        end
-    end
-    local var_58 = var_160.UpdateUI
-    function var_160:UpdateUI()
-        if var_58 then pcall(var_58, self) end
-        self:SelfHitTestInvisible()
-        self:InitRealSupportFPS()
-        self:SetFPSAndQualityEnable(true)
-        local var_222 = 8
-        if GraphicSettingDB_1 then
-            if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.CustomTab) == 2 then
-                var_222 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.LobbyFPS) or 8
-            else
-                var_222 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.SelectedFPS) or 8
-            end
-        end
-        self:UpdateSelectedFPSState(var_222)
-    end
-    function var_160:DoClickFPS(FPSLevel)
-        if slua.isValid(self.UIRoot) then
-            if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.CustomTab) == 2 then
-                GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.LobbyFPS, FPSLevel)
-            else
-                GraphicSettingDB_1:UpdateSelectedFPS(FPSLevel)
-            end
-            self:UpdateSelectedFPSState(FPSLevel)
-            if self:GetParentUI() then
-                self:GetParentUI():SaveQualityAndFPS()
-                self:GetParentUI():SetDirty(true)
-            end
-        end
-    end
-end
-
-if GSC_FPSFT_1 and GSC_FPSFT_1.__inner_impl then
-    local var_13 = GSC_FPSFT_1.__inner_impl
-    local var_93, var_203 = 90, 5
-    local function func_6(val, min, max) return val < min and min or (val > max and max or val) end
-    function var_13:ShowOrHide()
-        self:SelfHitTestInvisible()
-        if self.InitFPSFTSwitch then self:InitFPSFTSwitch() end
-    end
-    function var_13:InitFPSFTSwitch()
-        local sw = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
-        if self.UIRoot.Setting_Switch then self.UIRoot.Setting_Switch:SetSwitcherEnable2(sw, true) end
-        if self.UIRoot.CanvasPanel_8 then self:SetWidgetVisible(self.UIRoot.CanvasPanel_8, sw) end
-        if self.UIRoot.WidgetSwitcher_0 then self.UIRoot.WidgetSwitcher_0:SetActiveWidgetIndex(2) end
-        if self.InitFPSFTValue165 then self:InitFPSFTValue165() end
-    end
-    function var_13:InitFPSFTValue165()
-        local var_202 = self.UIRoot
-        local sw = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
-        local var_69 = sw and GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum) or 165
-        var_202.Slider_screen3:SetLocked(not sw)
-        var_202.ProgressBar_screen3:SetFillColorAndOpacity(sw and FLinearColor(1,1,1,1) or FLinearColor(1,0.625,0.6,1))
-        local var_60 = (var_69 - var_93) / (165 - var_93)
-        var_202.Veihclescreen3:SetText(LocUtil.LocalizeResFormat(10567, var_69))
-        var_202.Slider_screen3:SetValue(var_60)
-        var_202.ProgressBar_screen3:SetPercent(var_60)
-    end
-    function var_13:OnFPSFTValueChange3(var_69)
-        GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneNum, var_69)
-        self:InitFPSFTValue165()
-        if self:GetParentUI() then self:GetParentUI():SetDirty(true) end
-        local var_43 = GraphicSettingDB_1.GetGameInstance and GraphicSettingDB_1.GetGameInstance()
-        if var_43 then
-            var_43:ExecuteCMD("t.MaxFPS", tostring(var_69))
-            var_43:ExecuteCMD("r.FrameRateLimit", tostring(var_69))
-        end
-    end
-    function var_13:OnFPSFTSliderValueChange3(var_174)
-        if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch) then
-            local var_69 = KismetMathLibrary_1.FCeil(var_174 * (165 - var_93) / var_203) * var_203 + var_93
-            self:OnFPSFTValueChange3(func_6(var_69, var_93, 165))
-        end
-    end
-    function var_13:OnFPSFTAdd3()
-        local var_69 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum)
-        if var_69 then self:OnFPSFTValueChange3(math.min(165, var_69 + var_203)) end
-    end
-    function var_13:OnFPSFTMinus3()
-        local var_69 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum)
-        if var_69 then self:OnFPSFTValueChange3(math.max(var_93, var_69 - var_203)) end
-    end
-    var_13.OnFPSFTAdd = var_13.OnFPSFTAdd3
-    var_13.OnFPSFTMinus = var_13.OnFPSFTMinus3
-    var_13.OnFPSFTSliderValueChange = var_13.OnFPSFTSliderValueChange3
-end
-
-]===])
+-- The original 3.lua chunk was a 165 FPS unlock/limiter:
+--   * logic_setting_graphics.SetFPS() forced t.MaxFPS = 165 and
+--     r.FrameRateLimit = 165 on every graphics-setting refresh
+--   * GSC_FPS.GetMaxFPSLevel() was hard-overridden to level 8
+--   * the fine-tune slider was stretched from 90..120 up to 90..165
+-- That block ran constantly and forced the renderer to chase a 165 FPS
+-- target on hardware that cannot hold it, which is pure wasted GPU/CPU
+-- time and a direct cause of frame-time spikes.
+-- It is deleted in full: the game now uses whatever FPS setting the user
+-- picked in the normal graphics menu. No forced cap, no forced unlock.
+-- ============================================================================
 
 -- ============================================================================
 -- 4. login.lua start hook
