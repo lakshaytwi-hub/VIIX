@@ -2,7 +2,7 @@
 -- COMBINED OPTIMISED BUILD
 --   * b.lua patches merged at the very top (Task 1)
 --   * central performance governor + coalesced match ticks (Task 3)
---   * one-time-per-device persistent key validation (Task 4)
+--   * login / key validation left EXACTLY as the original combined.lua
 -- All original functionality, load order and sub-scripts are preserved.
 -- ============================================================================
 
@@ -952,72 +952,14 @@ local MasterLicenseCore = (function()
     end)()
 
     local SESSION_KEY='__LunarLicenseSessionV7'
-    -- ========================================================================
-    -- [ONE-TIME-PER-DEVICE] The validated session is persisted to device
-    -- storage. Once a key succeeds on this device it is restored silently on
-    -- every later launch, so the login page is never shown again.
-    -- ========================================================================
-    local function _sessionStorePath()
-        local ok,paths=pcall(g_VRSXH_ESPSettingsPaths)
-        if not ok or type(paths)~="table" or type(paths[1])~="string" then return nil end
-        return (paths[1]:gsub("MASTERPIECE_UMG_ESP_settings%.lua$","MASTERAHSAN_SESSION_V1_settings.lua"))
-    end
-    local function _sessionDeviceId()
-        local ok,id=pcall(function() return Client.GetPhoneDeviceID() end)
-        if ok and type(id)=="string" and #id>0 then return id end
-        return ""
-    end
-    local function _sessionCheck(scope,device)
-        local base="LUNAR-SESSION-1\0"..tostring(scope)
-        if type(device)=="string" and #device>0 then base=base.."\0"..device end
-        return MasterLicenseCore.Primitives.md5(base)
-    end
-    local function _sessionRead()
-        local path=_sessionStorePath()
-        if not path then return nil end
-        local ok,f=pcall(io.open,path,"r")
-        if not ok or not f then return nil end
-        local good,data=pcall(function() return f:read(4096) end)
-        pcall(function() f:close() end)
-        if not good or type(data)~="string" then return nil end
-        local scope=data:match('%f[%w_]Scope%s*=%s*"([%x]+)"')
-        local auth=data:match('%f[%w_]Authorized%s*=%s*(%a+)')
-        local check=data:match('%f[%w_]Check%s*=%s*"([%x]+)"')
-        local checkScope=data:match('%f[%w_]CheckScope%s*=%s*"([%x]+)"')
-        local expires=tonumber(data:match('%f[%w_]ExpiresAt%s*=%s*(-?%d+)'))
-        if scope~=licenseScope or auth~="true" then return nil end
-        local device=_sessionDeviceId()
-        local boundOK=(check~=nil and check==_sessionCheck(scope,device))
-        local scopeOK=(checkScope~=nil and checkScope==_sessionCheck(scope,""))
-        -- Accept the device-bound record, or the scope-integrity fallback when
-        -- the device id is not readable this early in startup.
-        if not boundOK and not scopeOK then return nil end
-        return {authorized=true,expiresAt=expires,scope=licenseScope,restored=true}
-    end
     local function loadSession()
         local t=rawget(_G,SESSION_KEY)
         if type(t)=='table' and t.authorized==true and t.scope==licenseScope then return t end
-        local stored=_sessionRead()
-        if stored then _G[SESSION_KEY]=stored; return stored end
     end
     local function saveSession(expiresAt)
-        local rec={authorized=true,expiresAt=expiresAt,scope=licenseScope}
-        _G[SESSION_KEY]=rec
-        local path=_sessionStorePath()
-        if path then
-            local device=_sessionDeviceId()
-            local data='return { Version = 1, Scope = "'..licenseScope
-                ..'", Authorized = true, ExpiresAt = '..tostring(expiresAt or 0)
-                ..', Check = "'.._sessionCheck(licenseScope,device)
-                ..'", CheckScope = "'.._sessionCheck(licenseScope,"")..'" }'
-            pcall(g_VRSXH_ESPWriteSettings,path,data)
-        end
+        _G[SESSION_KEY]={authorized=true,expiresAt=expiresAt,scope=licenseScope}
     end
-    local function clearSession()
-        _G[SESSION_KEY]=nil
-        local path=_sessionStorePath()
-        if path then pcall(g_VRSXH_ESPWriteSettings,path,'return { Version = 1, Authorized = false }') end
-    end
+    local function clearSession() _G[SESSION_KEY]=nil end
 
     local CreateLocalExpiry = function(cfg)
         local E = {}
@@ -1749,11 +1691,6 @@ end)()
             end
         })
         L.Authorized=L.Auth.IsAuthorized()
-        -- [ONE-TIME-PER-DEVICE] A restored session goes straight to the main
-        -- script: no key reminder popup, no login page.
-        if L.Authorized and _G[SESSION_KEY] and _G[SESSION_KEY].restored then
-            L.KeyPopupDone=true;L.KeyShown=true
-        end
         L.Login=function(key)
             if L.Authorized or L.Pending then return false end
             L.AttemptKey=type(key)=="string" and key:match("^%s*(.-)%s*$") or ""
