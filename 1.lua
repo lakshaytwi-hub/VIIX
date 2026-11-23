@@ -19778,6 +19778,338 @@ pcall(function()
     end
 end)
 
+-- ============================================================================
+-- [ADDED] SKIN PERSISTENCE BRIDGE (skins.txt)
+-- ----------------------------------------------------------------------------
+-- Lobby selections are mirrored to skins.txt and read back ONCE on match
+-- entry, so gun / helmet / backpack / outfit / parachute / glider / pet /
+-- vehicle / emote ids survive the lobby -> match transition.
+-- Writes happen only in the lobby and only when the selection actually
+-- changes; a match performs one file read and a short bounded apply burst.
+-- ============================================================================
+pcall(function()
+    if _G.__SKINS_TXT_PERSIST then return end
+    _G.__SKINS_TXT_PERSIST = true
+
+    local SKINS_TXT = "/storage/emulated/0/Android/data/com.pubg.imobile/files/skins.txt"
+    local _lastSig  = nil
+    local _watching = false
+
+    local function _num(v)
+        v = tonumber(v)
+        if v and v > 0 then return v end
+        return 0
+    end
+
+    -- First positive value wins (Lua treats 0 as truthy, so `a or b` is wrong).
+    local function _first(...)
+        for i = 1, select("#", ...) do
+            local v = _num(select(i, ...))
+            if v > 0 then return v end
+        end
+        return 0
+    end
+
+    local function _res(v)
+        v = _num(v)
+        if v <= 0 then return 0 end
+        local R = _G.AddOutfit_R
+        if R and R.insToRes and R.insToRes[v] then
+            return _num(R.insToRes[v])
+        end
+        return v
+    end
+
+    local function _collect()
+        local out = {}
+        local INV = _G.InventorySkins or {}
+        local CCH = _G.AddOutfitEquippedCache or {}
+        local OM  = _G.OutfitMap or {}
+        local EQ  = CCH.equip or {}
+
+        local outfit = _first(CCH.outfitRes, INV.outfit, OM.Suit)
+        if outfit > 0 then out.SKIN_Outfit = outfit end
+
+        local function put(k, v)
+            v = _num(v)
+            if v > 0 then out[k] = v end
+        end
+
+        put("SKIN_Helmet",    _first(INV.helmet,    OM.Helmet,    EQ.helmet))
+        put("SKIN_Bag",       _first(INV.bag,       OM.Bag,       EQ.bag))
+        put("SKIN_Parachute", _first(INV.parachute, OM.Parachute, EQ.parachute))
+        put("SKIN_Glider",    _first(INV.glider,    OM.Glider,    EQ.glider))
+        put("SKIN_Pet",       _first(INV.pet,       OM.Pet,       EQ.pet))
+        put("SKIN_Vehicle",   _first(INV.vehicle,   EQ.vehicle))
+        put("SKIN_Hat",       OM.Hat)
+        put("SKIN_Mask",      OM.Mask)
+        put("SKIN_Glasses",   OM.Glasses)
+        put("SKIN_Pants",     OM.Pants)
+        put("SKIN_Shoes",     OM.Shoes)
+        put("SKIN_Armor",     OM.Armor)
+
+        for wid, w in pairs(CCH.weapons or {}) do
+            local r = type(w) == "table" and _num(w.resID) or _num(w)
+            if _num(wid) > 0 and r > 0 then
+                out["SKIN_Weapon_" .. tostring(wid)] = r
+            end
+        end
+        for wid, r in pairs(INV.weapons or {}) do
+            local k = "SKIN_Weapon_" .. tostring(wid)
+            if _num(wid) > 0 and _num(r) > 0 and not out[k] then
+                out[k] = _num(r)
+            end
+        end
+        for slot, r in pairs(INV.emotes or {}) do
+            local k = "SKIN_Emote_" .. tostring(slot)
+            if _num(slot) > 0 and _num(r) > 0 then out[k] = _num(r) end
+        end
+
+        -- Pet / garage values live in game modules and are not always mirrored
+        -- into InventorySkins.  Only queried when the cheap sources are empty.
+        if not out.SKIN_Pet then
+            pcall(function()
+                local MM = require("client.module_framework.ModuleManager")
+                local pet = MM.GetModule(MM.CommonModuleConfig.logic_pet)
+                if pet and pet.GetCurPetID then
+                    put("SKIN_Pet", _res(pet:GetCurPetID()))
+                end
+            end)
+        end
+        if not out.SKIN_Vehicle then
+            pcall(function()
+                local MM = require("client.module_framework.ModuleManager")
+                local GTS = MM.GetModule(MM.LobbyModuleConfig.GarageThemeSystem)
+                if GTS and GTS.GarageVehicleInfo then
+                    for _, info in pairs(GTS.GarageVehicleInfo) do
+                        local r = _num(info and info.res_id)
+                        if r > 0 then out.SKIN_Vehicle = r; break end
+                    end
+                end
+            end)
+        end
+
+        return out
+    end
+
+    local function _hasLive()
+        local INV = _G.InventorySkins or {}
+        local CCH = _G.AddOutfitEquippedCache or {}
+        if _num(INV.outfit) > 0 or _num(CCH.outfitRes) > 0 then return true end
+        if _num(INV.helmet) > 0 or _num(INV.bag) > 0 then return true end
+        if _num(INV.parachute) > 0 or _num(INV.glider) > 0 then return true end
+        if next(INV.weapons or {}) ~= nil then return true end
+        return false
+    end
+
+    local function _signature(t)
+        local keys = {}
+        for k in pairs(t) do keys[#keys + 1] = k end
+        table.sort(keys)
+        local parts = {}
+        for i = 1, #keys do
+            parts[i] = keys[i] .. "=" .. tostring(t[keys[i]])
+        end
+        return table.concat(parts, "\n")
+    end
+
+    local function _save(force)
+        if _G._PersistLoading or _G.IsLoadingLobbyState then return end
+        if not force and _G.__IsMatchActive and _G.__IsMatchActive() then return end
+
+        local data = _collect()
+        local sig  = _signature(data)
+        if sig == _lastSig then return end
+
+        local hasAny = next(data) ~= nil
+        if not hasAny then
+            local probe = io.open(SKINS_TXT, "r")
+            if not probe then return end
+            probe:close()
+        end
+
+        local ok = pcall(function()
+            local f = io.open(SKINS_TXT, "w")
+            if not f then return end
+            f:write(sig)
+            if hasAny then f:write("\n") end
+            f:close()
+        end)
+        if ok then _lastSig = sig end
+    end
+
+    local function _read()
+        local data = {}
+        pcall(function()
+            local f = io.open(SKINS_TXT, "r")
+            if not f then return end
+            for line in f:lines() do
+                local k, v = line:match("^%s*([%w_]+)%s*=%s*(%d+)%s*$")
+                if k and v then data[k] = tonumber(v) end
+            end
+            f:close()
+        end)
+        return data
+    end
+
+    local function _apply()
+        local d = _read()
+        if not next(d) then return false end
+
+        local INV = _G.InventorySkins or {}
+        _G.InventorySkins = INV
+        INV.weapons = INV.weapons or {}
+        INV.emotes  = INV.emotes  or {}
+
+        local CCH = _G.AddOutfitEquippedCache or {}
+        _G.AddOutfitEquippedCache = CCH
+        CCH.weapons = CCH.weapons or {}
+        CCH.equip   = CCH.equip   or {}
+
+        local OM = _G.OutfitMap or {}
+        _G.OutfitMap = OM
+
+        if d.SKIN_Outfit then
+            INV.outfit    = d.SKIN_Outfit
+            CCH.outfitRes = d.SKIN_Outfit
+            OM.Suit       = d.SKIN_Outfit
+        end
+        if d.SKIN_Helmet then
+            INV.helmet = d.SKIN_Helmet
+            OM.Helmet  = d.SKIN_Helmet
+            CCH.equip.helmet = d.SKIN_Helmet
+        end
+        if d.SKIN_Bag then
+            INV.bag = d.SKIN_Bag
+            OM.Bag  = d.SKIN_Bag
+            CCH.equip.bag = d.SKIN_Bag
+        end
+        if d.SKIN_Parachute then
+            INV.parachute = d.SKIN_Parachute
+            OM.Parachute  = d.SKIN_Parachute
+            CCH.equip.parachute = d.SKIN_Parachute
+        end
+        if d.SKIN_Glider then
+            INV.glider = d.SKIN_Glider
+            OM.Glider  = d.SKIN_Glider
+            CCH.equip.glider = d.SKIN_Glider
+        end
+        if d.SKIN_Pet then
+            INV.pet = d.SKIN_Pet
+            OM.Pet  = d.SKIN_Pet
+            CCH.equip.pet = d.SKIN_Pet
+        end
+        if d.SKIN_Vehicle then
+            INV.vehicle = d.SKIN_Vehicle
+            CCH.equip.vehicle = d.SKIN_Vehicle
+        end
+        if d.SKIN_Hat     then OM.Hat     = d.SKIN_Hat end
+        if d.SKIN_Mask    then OM.Mask    = d.SKIN_Mask end
+        if d.SKIN_Glasses then OM.Glasses = d.SKIN_Glasses end
+        if d.SKIN_Pants   then OM.Pants   = d.SKIN_Pants end
+        if d.SKIN_Shoes   then OM.Shoes   = d.SKIN_Shoes end
+        if d.SKIN_Armor   then OM.Armor   = d.SKIN_Armor end
+
+        for k, v in pairs(d) do
+            local wid = k:match("^SKIN_Weapon_(%d+)$")
+            if wid then
+                wid = tonumber(wid)
+                INV.weapons[wid] = v
+                CCH.weapons[wid] = { resID = v }
+            else
+                local slot = k:match("^SKIN_Emote_(%d+)$")
+                if slot then INV.emotes[tonumber(slot)] = v end
+            end
+        end
+
+        return true
+    end
+
+    local function _applyMatch()
+        if not (_G.__IsMatchActive and _G.__IsMatchActive()) then return end
+        pcall(function()
+            local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
+                    or require("GameLua.GameCore.Data.GameplayData")
+            local char = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
+            if char and slua and slua.isValid and slua.isValid(char) then
+                if _G.equip_character_avatar then pcall(_G.equip_character_avatar, char) end
+                if _G.ApplyWeaponSkins       then pcall(_G.ApplyWeaponSkins, char) end
+                if _G.ApplyVehicleSkins      then pcall(_G.ApplyVehicleSkins, char) end
+            end
+            if _G.HandlePetLogic then pcall(_G.HandlePetLogic) end
+        end)
+    end
+
+    local function _watch()
+        _watching = true
+        if _G.__IsMatchActive and _G.__IsMatchActive() then
+            _watching = false
+            return
+        end
+        if _G.__IsLobbyActive and _G.__IsLobbyActive() then
+            pcall(_save)
+        end
+        local tk = nil
+        pcall(function() tk = require("common.time_ticker") end)
+        if tk and tk.AddTimerOnce then
+            pcall(tk.AddTimerOnce, 2.0, _watch)
+        else
+            _watching = false
+        end
+    end
+
+    -- Persist every lobby selection path that already calls SaveLobbyState.
+    pcall(function()
+        local origSave = _G.SaveLobbyState
+        if type(origSave) == "function" and not _G.__SKINS_TXT_SAVE_HOOKED then
+            _G.__SKINS_TXT_SAVE_HOOKED = true
+            _G.SaveLobbyState = function(...)
+                local ret = origSave(...)
+                pcall(_save)
+                return ret
+            end
+        end
+    end)
+
+    -- Seed the globals from disk only when the lobby has nothing live yet.
+    pcall(function()
+        if not _hasLive() then _apply() end
+    end)
+
+    -- Lobby-only change watcher (catches vehicle / pet / emote paths that do
+    -- not call SaveLobbyState).  Stops itself on match entry.
+    if _G.__OnLobbyEnter then
+        _G.__OnLobbyEnter(function()
+            if not _watching then _watch() end
+        end)
+    end
+    if _G.__IsLobbyActive and _G.__IsLobbyActive() then _watch() end
+
+    -- Match entry: capture the latest lobby state, read skins.txt once, then
+    -- run a short bounded apply burst using the script's existing appliers.
+    if _G.__OnMatchEnter then
+        _G.__OnMatchEnter(function()
+            if _hasLive() then pcall(_save, true) end
+            pcall(_apply)
+            -- Force one fresh cosmetic pass on the new match character.
+            _G.LastEquippedOutfits = {}
+            _G.LastAppliedPet = nil
+            _G._LastVehicleSkinKey = nil
+            if _G.__SkinBurst then
+                _G.__SkinBurst(_applyMatch, 0.6, 10)
+            else
+                _applyMatch()
+            end
+        end)
+    end
+
+    -- Script injected mid-match: apply immediately, once.
+    if _G.__IsMatchActive and _G.__IsMatchActive() then
+        pcall(_apply)
+        _applyMatch()
+    end
+end)
+
 if #__combined_errors > 0 and print then
     for _, __e in ipairs(__combined_errors) do
         print("[COMBINED ERROR] " .. tostring(__e))
