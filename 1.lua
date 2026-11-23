@@ -11912,6 +11912,8 @@ local ROOT_DIR   = "/storage/emulated/0/Android/data/com.pubg.imobile/files/"
 local SHADOW_TXT = ROOT_DIR .. "shadow_lobby.txt"
 local VRSXH_TXT  = ROOT_DIR .. "vrsxh_AddOutfit_Save_default.txt"
 local MATCH_TXT  = ROOT_DIR .. "match_skins.txt"
+-- [FIX] Older builds wrote the singular name; accept both.
+local MATCH_TXT_LEGACY = ROOT_DIR .. "match_skin.txt"
 -- [TASK3] attachment.txt is written in the LOBBY; match_skin.txt is read in a
 -- MATCH. attachments.txt is kept as a read-only legacy fallback.
 local ATTACH_TXT        = ROOT_DIR .. "attachment.txt"
@@ -13190,6 +13192,7 @@ do
             if IsInMatch() then
                 AC = {}; ACValidSet = {}; AttachToBase = {}
                 local count = _readAttachFile(MATCH_TXT)
+                if count == 0 then count = _readAttachFile(MATCH_TXT_LEGACY) end
                 if count > 0 then ACLoaded = true end
                 return
             end
@@ -13238,6 +13241,7 @@ do
                 para = 0, glider = 0, weapons = {}, vehicles = {}, loaded = true
             }
             local f = io.open(MATCH_TXT, "r")
+            if not f then f = io.open(MATCH_TXT_LEGACY, "r") end
             if f then
                 for line in f:lines() do
                     local k, v = line:match("^([%w_]+%d*)=(.+)$")
@@ -13501,14 +13505,28 @@ do
                     local curID  = tonumber(eq.ItemId or eq.ItemID) or 0
                     local target = 0
 
-                    if slotID == 8 and curID > 0 and V1State.bagLv3 > 0 then
+                    -- [FIX] In a match the per-level value comes from
+                    -- match_skins.txt (MC.bag / MC.helmet).  V1State is
+                    -- lobby-only state and is often 0 once the match starts,
+                    -- which is why helmet/backpack skins never applied.
+                    if slotID == 8 and curID > 0 then
                         local lvl = (bu and bu.GetEquipmentBagLevel and bu.GetEquipmentBagLevel(eq.AdditionalItemID)) or 3
                         if lvl < 1 or lvl > 3 then lvl = 3 end
-                        target = ConvertBagHelmetLevel(V1State.bagLv3, lvl)
-                    elseif slotID == 9 and curID > 0 and V1State.helmetLv3 > 0 then
+                        local cached = MC.bag and tonumber(MC.bag[lvl]) or 0
+                        if cached and cached > 0 then
+                            target = cached
+                        elseif V1State.bagLv3 > 0 then
+                            target = ConvertBagHelmetLevel(V1State.bagLv3, lvl)
+                        end
+                    elseif slotID == 9 and curID > 0 then
                         local lvl = (bu and bu.GetEquipmentHelmetLevel and bu.GetEquipmentHelmetLevel(eq.AdditionalItemID)) or 3
                         if lvl < 1 or lvl > 3 then lvl = 3 end
-                        target = ConvertBagHelmetLevel(V1State.helmetLv3, lvl)
+                        local cached = MC.helmet and tonumber(MC.helmet[lvl]) or 0
+                        if cached and cached > 0 then
+                            target = cached
+                        elseif V1State.helmetLv3 > 0 then
+                            target = ConvertBagHelmetLevel(V1State.helmetLv3, lvl)
+                        end
                     elseif slotID == 11 and paraRes > 0 then
                         -- Slot 11 is often still 0 until the parachute actually spawns,
                         -- so requiring curID > 0 meant the skin was never applied.
@@ -13623,11 +13641,12 @@ do
         local _wasInMatch = false
 
         local function masterZeroLagTick()
-            if inCombat() then return end
-
             if IsInLobby() then
                 if _wasInMatch then
                     _wasInMatch = false
+                    -- [FIX] reset the match controller when we leave a match
+                    _COS.loaded = false; _COS.slotSig = nil; _COS.weaponSig = -1
+                    _COS.wasDead = false; _COS.burstLeft = 0; _COS.slotSigInit = false
                     collectgarbage("step", 80)
                 end
                 pcall(_G.LoadLobbyEmotes)
@@ -13639,33 +13658,218 @@ do
 
             if not _wasInMatch then
                 _wasInMatch = true
-                -- [PERF/TASK2] One-shot read of match_skin.txt on match entry.
-                pcall(loadMatchCache)
-                pcall(loadAttachCache)
+                -- [FIX] one-shot: load match_skins.txt + arm the entry burst
+                pcall(MatchCosOnEnter)
             end
 
-            -- [PERF] After the entry window this master tick does nothing.
-            if not _G.__SkinTickAllowed() then return end
+            -- [FIX] Edge driven: revive / weapon change / item change / burst.
+            -- In steady state this is a couple of integer compares, no file IO,
+            -- no table rebuilds, no per-tick weapon scans.
+            pcall(MatchCosTick)
+        end
 
+
+        -- ====================================================================
+        -- [FIX] MATCH COSMETIC CONTROLLER
+        -- --------------------------------------------------------------------
+        -- One place that decides when in-match cosmetics are fetched.  Every
+        -- trigger fires exactly once:
+        --   * match entry        -> MatchCosOnEnter   (load caches + burst)
+        --   * revive / recall    -> MatchCosOnRevive  (reload + short burst)
+        --   * gun change         -> weapon signature edge
+        --   * helmet/bag/outfit  -> slot signature edge
+        -- In a match the ONLY file ever read is match_skins.txt (once per
+        -- trigger).  Nothing here loops in the background: the driver runs
+        -- inside the existing 0.8s master tick and returns immediately
+        -- unless an edge actually fired.
+        -- ====================================================================
+        local _COS = _G.__MATCH_COS or {
+            loaded      = false,   -- caches armed for this match
+            slotSig     = nil,     -- equipped-item edge
+            slotSigInit = false,
+            weaponSig   = -1,      -- weapon-set edge
+            wasDead     = false,   -- revive edge
+            burstLeft   = 0,       -- bounded re-apply passes
+            burstAt     = 0,
+        }
+        _G.__MATCH_COS = _COS
+
+        -- Force a fresh read of the match cache.  In a match this opens
+        -- exactly ONE file and only when a trigger calls it.
+        local function MatchCosLoadCaches()
+            ACLoaded = false
+            pcall(loadMatchCache)
+            pcall(loadAttachCache)
+            _COS.loaded = true
+        end
+        _G.__MatchCosLoadCaches = MatchCosLoadCaches
+
+        local function MatchCosIsDead(char)
+            if not SafeValid(char) then return false end
+            local ok, dead = pcall(function()
+                if char.bDead == true or char.bIsDead == true then return true end
+                if char.bIsGroggy == true or char.bGroggy == true then return true end
+                local h = tonumber(char.Health)
+                if h == nil and char.GetHealth then h = tonumber(char:GetHealth()) end
+                if h ~= nil then return h <= 0 end
+                return false
+            end)
+            return ok and dead == true
+        end
+
+        -- Cheap integer signature over the equipped weapon set.
+        local function MatchCosWeaponSig(char)
+            local wm = char.GetWeaponManager and char:GetWeaponManager()
+            if not SafeValid(wm) then return -1 end
+            local list = wm.GetAllInventoryWeaponList and wm:GetAllInventoryWeaponList(false)
+            if not SafeValid(list) then return -1 end
+            local n = list:Num()
+            local sig = n
+            for i = 0, n - 1 do
+                local w = list:Get(i)
+                if SafeValid(w) then
+                    sig = (sig * 131 + (tonumber(w:GetWeaponID()) or 0)) % 2147483647
+                end
+            end
+            return sig
+        end
+
+        -- Cheap integer signature over the cosmetic slots only.
+        local function MatchCosSlotSig(char)
+            local ac = char.AvatarComponent2
+                    or char.CharacterAvatarComp2_BP
+                    or char.CharacterAvatarComponent_BP
+                    or char.CharacterAvatarComponent
+                    or char.AvatarComponent
+                    or (char.getAvatarComponent2 and char:getAvatarComponent2())
+            if not SafeValid(ac) or not ac.NetAvatarData then return -1 end
+            local sd = ac.NetAvatarData.SlotSyncData
+            if not SafeValid(sd) then return -1 end
+            local n = sd:Num()
+            local sig = n
+            for i = 0, n - 1 do
+                local eq = sd:Get(i)
+                if eq then
+                    local sid = tonumber(eq.SlotID) or 0
+                    -- 1/2 body+head, 8 bag, 9 helmet, 11 parachute, 15 glider
+                    if sid == 1 or sid == 2 or sid == 8 or sid == 9
+                       or sid == 11 or sid == 15 then
+                        sig = (sig * 131 + sid * 7919
+                               + (tonumber(eq.ItemId or eq.ItemID) or 0)) % 2147483647
+                    end
+                end
+            end
+            return sig
+        end
+
+        -- Apply everything for the current pawn.  Idempotent: every setter
+        -- below compares against the current value before writing.
+        local function MatchCosApplyAll()
+            local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
+            local char = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
+            if not SafeValid(char) then return false end
+
+            -- outfit / clothes / helmet / backpack / parachute / glider
+            pcall(applyAllCharacterSlotsUnified, char)
+
+            -- every equipped gun: skin + its attachments (per-weapon dedupe)
+            pcall(function()
+                local wm = char.GetWeaponManager and char:GetWeaponManager()
+                if not SafeValid(wm) then return end
+                local list = wm.GetAllInventoryWeaponList and wm:GetAllInventoryWeaponList(false)
+                if not SafeValid(list) then return end
+                for i = 0, list:Num() - 1 do
+                    local w = list:Get(i)
+                    if SafeValid(w) then applySingleWeaponFast(w) end
+                end
+            end)
+            return true
+        end
+        _G.__MatchCosApplyAll = MatchCosApplyAll
+        -- read-only view of the parsed match cache (diagnostics / menu)
+        _G.__MatchCosGetMC = function() return MC end
+        _G.__MatchCosApplySlots = function(c) return applyAllCharacterSlotsUnified(c) end
+
+        -- ONCE per match entry.
+        local function MatchCosOnEnter()
+            if _COS.loaded then return end
+            _COS.slotSig     = nil
+            _COS.slotSigInit = false
+            _COS.weaponSig   = -1
+            _COS.wasDead     = false
+            _COS.burstLeft   = 8          -- 8 passes over ~4s while pawns spawn
+            _COS.burstAt     = 0
+            MatchCosLoadCaches()
+        end
+        _G.__MatchCosOnEnter = MatchCosOnEnter
+
+        -- ONCE per revive / recall.
+        local function MatchCosOnRevive()
+            -- The pawn is usually a brand-new object after a recall, so the
+            -- per-object guards must be cleared or the outfit/glider would be
+            -- considered "already applied" and skipped.
+            _appliedCharInit = setmetatable({}, { __mode = "k" })
+            _ensuredGliderSD = setmetatable({}, { __mode = "k" })
+            _WeaponStateSig  = setmetatable({}, { __mode = "k" })
+            MatchCosLoadCaches()
+            _COS.slotSig     = nil
+            _COS.slotSigInit = false
+            _COS.weaponSig   = -1
+            _COS.burstLeft   = 4
+            _COS.burstAt     = 0
+        end
+        _G.__MatchCosOnRevive = MatchCosOnRevive
+
+        -- Called from the existing 0.8s master tick, in-match only.
+        local function MatchCosTick()
             local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
             local char = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
             if not SafeValid(char) then return end
 
-            pcall(applyAllCharacterSlotsUnified, char)
+            -- revive / recall edge (exactly once per event)
+            local dead = MatchCosIsDead(char)
+            if _COS.wasDead and not dead then
+                pcall(MatchCosOnRevive)
+            end
+            _COS.wasDead = dead
+            if dead then return end
 
-            pcall(function()
-                local wm = char:GetWeaponManager()
-                if not SafeValid(wm) then return end
-                local list = wm:GetAllInventoryWeaponList(false)
-                if not SafeValid(list) then return end
-                for i = 0, list:Num() - 1 do
-                    local w = list:Get(i)
-                    if SafeValid(w) then
-                        applySingleWeaponFast(w)
+            -- gun change edge (exactly once per change)
+            local wsig = MatchCosWeaponSig(char)
+            if wsig >= 0 and wsig ~= _COS.weaponSig then
+                _COS.weaponSig = wsig
+                pcall(function()
+                    local wm = char:GetWeaponManager()
+                    local list = wm and wm:GetAllInventoryWeaponList(false)
+                    if not SafeValid(list) then return end
+                    for i = 0, list:Num() - 1 do
+                        local w = list:Get(i)
+                        if SafeValid(w) then applySingleWeaponFast(w) end
                     end
+                end)
+            end
+
+            -- helmet / backpack / outfit change edge (exactly once per change)
+            local ssig = MatchCosSlotSig(char)
+            if ssig >= 0 and ssig ~= _COS.slotSig then
+                _COS.slotSig = ssig
+                if _COS.slotSigInit and not inCombat() then
+                    pcall(applyAllCharacterSlotsUnified, char)
                 end
-            end)
+                _COS.slotSigInit = true
+            end
+
+            -- bounded entry / revive burst, then silent for the rest of the match
+            if _COS.burstLeft > 0 then
+                local now = os.clock()
+                if now - _COS.burstAt >= 0.5 then
+                    _COS.burstAt   = now
+                    _COS.burstLeft = _COS.burstLeft - 1
+                    if not inCombat() then pcall(MatchCosApplyAll) end
+                end
+            end
         end
+        _G.__MatchCosTick = MatchCosTick
 
         pcall(loadAttachCache)
         pcall(loadMatchCache)
@@ -19383,6 +19587,10 @@ end
 pcall(function()
     if not _G.__OnMatchEnter then return end
     _G.__OnMatchEnter(function()
+        -- [FIX] arm the match cosmetic controller (one-shot cache load)
+        pcall(function()
+            if _G.__MatchCosOnEnter then _G.__MatchCosOnEnter() end
+        end)
         _G.__SkinBurst(function()
             pcall(function()
                 local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
@@ -19401,7 +19609,7 @@ pcall(function()
                 if _G.ForceEnableKillCounterUI then pcall(_G.ForceEnableKillCounterUI) end
                 if _G.RefreshKillCounterUI     then pcall(_G.RefreshKillCounterUI) end
             end)
-        end, 0.5, 12)   -- 12 passes over ~6s, then silent for the rest of the match
+        end, 0.7, 6)    -- 6 passes over ~4s, then silent for the rest of the match
     end)
 end)
 
