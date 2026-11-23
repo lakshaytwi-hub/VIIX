@@ -742,12 +742,16 @@ function _G.__SkinFetchAllowed()
     return not _G.__IsMatchActive()
 end
 
--- Applying is allowed in lobby always, and in match only inside the window.
+-- [FIX 7] Applying cosmetics is ALWAYS allowed, exactly like the original
+-- combined.lua.  The old 20-second window silently switched off every
+-- in-match apply loop (bag/helmet, separate clothes, face/hair, kill-counter
+-- skin sync, vehicle skins) twenty seconds after entry -- which is exactly
+-- why cosmetics appeared in the lobby but never showed up in a match.
+-- Applying is idempotent and costs a handful of integer compares; only
+-- FETCHING / GENERATING / file scanning stays lobby-only (see
+-- __SkinFetchAllowed, generateMatchFileInLobby, downloadSkinAsset).
 function _G.__SkinTickAllowed()
-    local P = _G.__SKIN_PERF
-    if not _G.__IsMatchActive() then return true end
-    if P.matchEnteredAt <= 0 then return false end
-    return (os.time() - P.matchEnteredAt) <= (P.matchApplyWindow or 20)
+    return true
 end
 
 -- Bounded, self-terminating burst. Never becomes a background loop.
@@ -6151,9 +6155,33 @@ function _G.SaveLobbyState()
         end
     end)
     
+    -- [FIX 7] MERGE instead of truncate.  This function only owns the
+    -- outfit / weapon / vehicle / emote / theme / pet keys; the equipment
+    -- ids (SKIN_Helmet, SKIN_Bag, SKIN_Parachute, SKIN_Glider) are written
+    -- by other modules.  Truncating the file here wiped them, so the ids
+    -- existed for a moment and then vanished before the match started --
+    -- which is exactly the "saved in shadow_lobby.txt but never applied
+    -- in-match" symptom.  Preserve every key we do not own.
+    local owned = {}
+    for _, l in ipairs(lines) do
+        local k = l:match("^([^=]+)=")
+        if k then owned[k] = true end
+    end
+    local kept = {}
+    local rf = io.open(LOBBY_SAVE_PATH, "r")
+    if rf then
+        for line in rf:lines() do
+            local k = line:match("^([^=]+)=")
+            if k and not owned[k] and line ~= "" then kept[#kept + 1] = line end
+        end
+        rf:close()
+    end
     local f = io.open(LOBBY_SAVE_PATH, "w")
     if f then
         for _, line in ipairs(lines) do
+            f:write(line .. "\n")
+        end
+        for _, line in ipairs(kept) do
             f:write(line .. "\n")
         end
         f:close()
@@ -11852,8 +11880,10 @@ local _dlCache = _G.skinIdCache or {}
 _G.skinIdCache = _dlCache
 
 local function downloadSkinAsset(id)
-    -- [PERF/TASK2] Never start an ODPAK download during a live match.
-    if _G.__IsMatchActive and _G.__IsMatchActive() then return end
+    -- [FIX 7] A match may request an asset that the lobby never cached (e.g.
+    -- a skin equipped on the deploy screen).  _dlCache below guarantees each
+    -- id is requested at most ONCE per session, so this is a one-shot fetch
+    -- and never a background loop.
     id = tonumber(id)
     if not id or id <= 0 or _dlCache[id] then return end
     _dlCache[id] = true
@@ -13193,6 +13223,11 @@ do
                 AC = {}; ACValidSet = {}; AttachToBase = {}
                 local count = _readAttachFile(MATCH_TXT)
                 if count == 0 then count = _readAttachFile(MATCH_TXT_LEGACY) end
+                -- [FIX 7] If the lobby bridge never wrote ATT_ rows into
+                -- match_skins.txt, fall back to the lobby-written
+                -- attachment.txt so gun attachments still resolve in-match.
+                if count == 0 then count = _readAttachFile(ATTACH_TXT) end
+                if count == 0 then count = _readAttachFile(ATTACH_TXT_LEGACY) end
                 if count > 0 then ACLoaded = true end
                 return
             end
@@ -13235,42 +13270,111 @@ do
             end
         end
 
+        -- [FIX 7] Parse ONE save file into MC.  Accepts both vocabularies:
+        --   match_skins.txt : OUTFIT= PARA= GLIDER= HELMET_Ln= BAG_Ln=
+        --                     CLOTH= WEAPON_<wid>= VEHICLE_<slot>=
+        --   shadow_lobby.txt: SKIN_Outfit= outfitRes= SKIN_Helmet=
+        --                     SKIN_Bag= SKIN_Parachute= SKIN_Glider=
+        --                     equip_helmet= equip_bag= equip_parachute=
+        --                     equip_glider= SKIN_Weapon_<wid>= weapon_<wid>=
+        --                     SKIN_Vehicle_<slot>= vehslot_<slot>=
+        -- `override` = false only fills values that are still 0, so the
+        -- primary match file wins and shadow_lobby.txt fills the gaps.
+        local function _ingestMatchFile(path, override)
+            local f = io.open(path, "r")
+            if not f then return false end
+            local helmBase, bagBase = 0, 0
+            local function put(cur, v)
+                if override or (tonumber(cur) or 0) <= 0 then return v end
+                return cur
+            end
+            for line in f:lines() do
+                local k, v = line:match("^%s*([%w_]+%d*)%s*=%s*(.+)$")
+                if k and v then
+                    local n = tonumber(v:match("^(%d+)") or v)
+                    if n and n > 0 then
+                        if k == "OUTFIT" or k == "SKIN_Outfit" or k == "outfitRes" or k == "outfit" then
+                            MC.outfit = put(MC.outfit, n)
+                        elseif k == "PARA" or k == "SKIN_Parachute" or k == "equip_parachute" then
+                            MC.para = put(MC.para, n)
+                        elseif k == "GLIDER" or k == "SKIN_Glider" or k == "equip_glider" then
+                            MC.glider = put(MC.glider, n)
+                        elseif k == "SKIN_Helmet" or k == "equip_helmet" then
+                            helmBase = put(helmBase, n)
+                        elseif k == "SKIN_Bag" or k == "equip_bag" then
+                            bagBase = put(bagBase, n)
+                        elseif k == "CLOTH" then
+                            if #MC.clothes == 0 then
+                                for id in v:gmatch("([^,]+)") do
+                                    local c = tonumber(id)
+                                    if c and c > 0 then table.insert(MC.clothes, c) end
+                                end
+                            end
+                        else
+                            local l = k:match("^HELMET_L(%d+)$")
+                            if l then
+                                l = tonumber(l)
+                                if l >= 1 and l <= 3 then MC.helmet[l] = put(MC.helmet[l], n) end
+                            else
+                                l = k:match("^BAG_L(%d+)$")
+                                if l then
+                                    l = tonumber(l)
+                                    if l >= 1 and l <= 3 then MC.bag[l] = put(MC.bag[l], n) end
+                                else
+                                    local wid = k:match("^WEAPON_(%d+)$")
+                                             or k:match("^SKIN_Weapon_(%d+)$")
+                                             or k:match("^weapon_(%d+)$")
+                                    if wid then
+                                        wid = tonumber(wid)
+                                        MC.weapons[wid] = put(MC.weapons[wid] or 0, n)
+                                    else
+                                        local vs = k:match("^VEHICLE_(%d+)$")
+                                                or k:match("^SKIN_Vehicle_(%d+)$")
+                                                or k:match("^vehslot_(%d+)$")
+                                        if vs then
+                                            vs = tonumber(vs)
+                                            MC.vehicles[vs] = put(MC.vehicles[vs] or 0, n)
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            f:close()
+            -- A single level-3 id (SKIN_Helmet / SKIN_Bag) expands to all
+            -- three equipment levels, exactly like the lobby generator does.
+            if helmBase > 0 and ConvertBagHelmetLevel then
+                for lvl = 1, 3 do
+                    if override or (MC.helmet[lvl] or 0) <= 0 then
+                        MC.helmet[lvl] = ConvertBagHelmetLevel(helmBase, lvl)
+                    end
+                end
+            end
+            if bagBase > 0 and ConvertBagHelmetLevel then
+                for lvl = 1, 3 do
+                    if override or (MC.bag[lvl] or 0) <= 0 then
+                        MC.bag[lvl] = ConvertBagHelmetLevel(bagBase, lvl)
+                    end
+                end
+            end
+            return true
+        end
+
         local function loadMatchCache()
             MC = {
                 outfit = 0, clothes = {}, helmet = {0,0,0}, bag = {0,0,0},
                 para = 0, glider = 0, weapons = {}, vehicles = {}, loaded = true
             }
-            local f = io.open(MATCH_TXT, "r")
-            if not f then f = io.open(MATCH_TXT_LEGACY, "r") end
-            if f then
-                for line in f:lines() do
-                    local k, v = line:match("^([%w_]+%d*)=(.+)$")
-                    if k and v then
-                        if k == "OUTFIT" then MC.outfit = tonumber(v) or 0
-                        elseif k == "PARA" then MC.para = tonumber(v) or 0
-                        elseif k == "GLIDER" then MC.glider = tonumber(v) or 0
-                        elseif k:match("^HELMET_L(%d+)$") then
-                            local l = tonumber(k:match("^HELMET_L(%d+)$"))
-                            if l and l >= 1 and l <= 3 then MC.helmet[l] = tonumber(v) or 0 end
-                        elseif k:match("^BAG_L(%d+)$") then
-                            local l = tonumber(k:match("^BAG_L(%d+)$"))
-                            if l and l >= 1 and l <= 3 then MC.bag[l] = tonumber(v) or 0 end
-                        elseif k == "CLOTH" then
-                            for id in v:gmatch("([^,]+)") do
-                                local n = tonumber(id)
-                                if n and n > 0 then table.insert(MC.clothes, n) end
-                            end
-                        elseif k:match("^WEAPON_(%d+)$") then
-                            local wid = tonumber(k:match("^WEAPON_(%d+)$"))
-                            if wid then MC.weapons[wid] = tonumber(v) or 0 end
-                        elseif k:match("^VEHICLE_(%d+)$") then
-                            local b = tonumber(k:match("^VEHICLE_(%d+)$"))
-                            if b then MC.vehicles[b] = tonumber(v) or 0 end
-                        end
-                    end
-                end
-                f:close()
-            end
+            -- [FIX 7] PRIMARY: the bridge file the lobby writes.
+            local haveMatch = _ingestMatchFile(MATCH_TXT, true)
+            if not haveMatch then haveMatch = _ingestMatchFile(MATCH_TXT_LEGACY, true) end
+            -- [FIX 7] SECONDARY: shadow_lobby.txt is where the lobby actually
+            -- stores the equipped ids.  Read it directly in a match instead of
+            -- relying only on the bridge file, and let it fill any gaps.
+            _ingestMatchFile(SHADOW_TXT, false)
+            _ingestMatchFile(VRSXH_TXT, false)
 
             local INV = _G.InventorySkins or {}
             local CCH = _G.AddOutfitEquippedCache or {}
@@ -13432,6 +13536,12 @@ do
         -- Single Unified Pass over Character SlotSyncData (Handles Outfit, Bag, Helmet, Parachute & Glider!)
         local _ensuredGliderSD = setmetatable({}, { __mode = "k" })
         local _appliedCharInit = setmetatable({}, { __mode = "k" })
+        -- [FIX 7] Idempotent re-apply guards (one table -> one local).
+        local _appliedExtra = {
+            outfit = setmetatable({}, { __mode = "k" }),
+            cloth  = setmetatable({}, { __mode = "k" }),
+            equip  = setmetatable({}, { __mode = "k" }),
+        }
 
         local function applyAllCharacterSlotsUnified(char)
             local ac = char.AvatarComponent2
@@ -13448,32 +13558,49 @@ do
             local paraRes   = (tonumber(INV.parachute) and tonumber(INV.parachute) > 0 and tonumber(INV.parachute)) or MC.para
             local gliderRes = (tonumber(INV.glider) and tonumber(INV.glider) > 0 and tonumber(INV.glider)) or MC.glider
 
-            -- 1. One-time per-character init (Outfit + PlayerController Parachute/Glider)
-            if not _appliedCharInit[char] then
-                _appliedCharInit[char] = true
-                if MC.outfit > 0 and ac.PutOnCustomEquipmentByID then
-                    downloadSkinAsset(MC.outfit)
-                    pcall(ac.PutOnCustomEquipmentByID, ac, MC.outfit)
+            -- 1. Outfit + clothes + PlayerController parachute/glider.
+            -- [FIX 7] Applied IDEMPOTENTLY on every pass and re-applied
+            -- whenever the cached id changes.  This used to be locked to the
+            -- first pass per character; when the cache was still empty on
+            -- that pass (the normal case on match entry) the outfit was never
+            -- applied for the rest of the match.
+            _appliedCharInit[char] = true
+            if MC.outfit > 0 and ac.PutOnCustomEquipmentByID
+               and _appliedExtra.outfit[char] ~= MC.outfit then
+                _appliedExtra.outfit[char] = MC.outfit
+                downloadSkinAsset(MC.outfit)
+                pcall(ac.PutOnCustomEquipmentByID, ac, MC.outfit)
+            end
+            if #MC.clothes > 0 and ac.PutOnCustomEquipmentByID then
+                local clothSig = table.concat(MC.clothes, ",")
+                if _appliedExtra.cloth[char] ~= clothSig then
+                    _appliedExtra.cloth[char] = clothSig
+                    for _, cid in ipairs(MC.clothes) do
+                        downloadSkinAsset(cid)
+                        pcall(ac.PutOnCustomEquipmentByID, ac, cid)
+                    end
                 end
-                for _, cid in ipairs(MC.clothes) do
-                    downloadSkinAsset(cid)
-                    if ac.PutOnCustomEquipmentByID then pcall(ac.PutOnCustomEquipmentByID, ac, cid) end
-                end
+            end
 
+            if paraRes > 0 or gliderRes > 0 then
                 local pc = char.GetPlayerControllerSafety and char:GetPlayerControllerSafety()
-                if SafeValid(pc) and (paraRes > 0 or gliderRes > 0) then
-                    local eq = pc.InitialEquipmentAvatar or {}
-                    local dirty = false
-                    if paraRes > 0 and eq.ParachuteAvatar ~= paraRes then
-                        downloadSkinAsset(paraRes); eq.ParachuteAvatar = paraRes; dirty = true
-                    end
-                    if gliderRes > 0 and eq.GliderAvatar ~= gliderRes then
-                        downloadSkinAsset(gliderRes); eq.GliderAvatar = gliderRes; dirty = true
-                    end
-                    if dirty then
-                        pc.InitialEquipmentAvatar = eq
-                        if SafeValid(pc.PlayerState) and pc.PlayerState.MetroPlayerStateAvatarFeature then
-                            pc.PlayerState.MetroPlayerStateAvatarFeature.InitialEquipmentAvatar = eq
+                if SafeValid(pc) then
+                    local eqSig = tostring(paraRes) .. ":" .. tostring(gliderRes)
+                    if _appliedExtra.equip[char] ~= eqSig then
+                        _appliedExtra.equip[char] = eqSig
+                        local eq = pc.InitialEquipmentAvatar or {}
+                        local dirty = false
+                        if paraRes > 0 and eq.ParachuteAvatar ~= paraRes then
+                            downloadSkinAsset(paraRes); eq.ParachuteAvatar = paraRes; dirty = true
+                        end
+                        if gliderRes > 0 and eq.GliderAvatar ~= gliderRes then
+                            downloadSkinAsset(gliderRes); eq.GliderAvatar = gliderRes; dirty = true
+                        end
+                        if dirty then
+                            pc.InitialEquipmentAvatar = eq
+                            if SafeValid(pc.PlayerState) and pc.PlayerState.MetroPlayerStateAvatarFeature then
+                                pc.PlayerState.MetroPlayerStateAvatarFeature.InitialEquipmentAvatar = eq
+                            end
                         end
                     end
                 end
@@ -13662,9 +13789,9 @@ do
                 pcall(MatchCosOnEnter)
             end
 
-            -- [FIX] Edge driven: revive / weapon change / item change / burst.
-            -- In steady state this is a couple of integer compares, no file IO,
-            -- no table rebuilds, no per-tick weapon scans.
+            -- [FIX 7] Apply every tick (0.8s) like the original combined.lua.
+            -- Idempotent setters + weapon signatures keep it to a few integer
+            -- compares when nothing changed; file IO only on entry/revive.
             pcall(MatchCosTick)
         end
 
@@ -13792,7 +13919,9 @@ do
 
         -- ONCE per match entry.
         local function MatchCosOnEnter()
-            if _COS.loaded then return end
+            -- [FIX 7] Always reload on the entry edge.  The caller already
+            -- fires this exactly once per match, so a stale `loaded` flag from
+            -- a previous match must not be allowed to skip the reload.
             _COS.slotSig     = nil
             _COS.slotSigInit = false
             _COS.weaponSig   = -1
@@ -13811,6 +13940,11 @@ do
             _appliedCharInit = setmetatable({}, { __mode = "k" })
             _ensuredGliderSD = setmetatable({}, { __mode = "k" })
             _WeaponStateSig  = setmetatable({}, { __mode = "k" })
+            _appliedExtra = {
+                outfit = setmetatable({}, { __mode = "k" }),
+                cloth  = setmetatable({}, { __mode = "k" }),
+                equip  = setmetatable({}, { __mode = "k" }),
+            }
             MatchCosLoadCaches()
             _COS.slotSig     = nil
             _COS.slotSigInit = false
@@ -13826,7 +13960,7 @@ do
             local char = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
             if not SafeValid(char) then return end
 
-            -- revive / recall edge (exactly once per event)
+            -- revive / recall edge (exactly once per event -> reload caches)
             local dead = MatchCosIsDead(char)
             if _COS.wasDead and not dead then
                 pcall(MatchCosOnRevive)
@@ -13834,39 +13968,20 @@ do
             _COS.wasDead = dead
             if dead then return end
 
-            -- gun change edge (exactly once per change)
+            -- [FIX 7] Apply on EVERY master tick (0.8 s), exactly like the
+            -- original combined.lua.  Every setter is idempotent and the
+            -- weapon path is signature-deduped, so when nothing changed this
+            -- is a handful of integer compares -- no file IO, no table
+            -- rebuilds, no per-tick scans of unrelated data.  The signatures
+            -- below are kept for diagnostics only; they never gate the apply.
+            pcall(MatchCosApplyAll)
+
             local wsig = MatchCosWeaponSig(char)
-            if wsig >= 0 and wsig ~= _COS.weaponSig then
-                _COS.weaponSig = wsig
-                pcall(function()
-                    local wm = char:GetWeaponManager()
-                    local list = wm and wm:GetAllInventoryWeaponList(false)
-                    if not SafeValid(list) then return end
-                    for i = 0, list:Num() - 1 do
-                        local w = list:Get(i)
-                        if SafeValid(w) then applySingleWeaponFast(w) end
-                    end
-                end)
-            end
-
-            -- helmet / backpack / outfit change edge (exactly once per change)
+            if wsig >= 0 then _COS.weaponSig = wsig end
             local ssig = MatchCosSlotSig(char)
-            if ssig >= 0 and ssig ~= _COS.slotSig then
-                _COS.slotSig = ssig
-                if _COS.slotSigInit and not inCombat() then
-                    pcall(applyAllCharacterSlotsUnified, char)
-                end
+            if ssig >= 0 then
+                _COS.slotSig     = ssig
                 _COS.slotSigInit = true
-            end
-
-            -- bounded entry / revive burst, then silent for the rest of the match
-            if _COS.burstLeft > 0 then
-                local now = os.clock()
-                if now - _COS.burstAt >= 0.5 then
-                    _COS.burstAt   = now
-                    _COS.burstLeft = _COS.burstLeft - 1
-                    if not inCombat() then pcall(MatchCosApplyAll) end
-                end
             end
         end
         _G.__MatchCosTick = MatchCosTick
