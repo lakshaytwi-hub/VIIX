@@ -1,181 +1,25 @@
-
 -- ============================================================================
 -- COMBINED BUILD: login.lua + 1.lua + 2.lua + 3.lua
 -- ============================================================================
 
 -- ============================================================================
 -- [INTEGRATED] 5_6332112181898781672.lua
--- Placed at the very top so its protection/bypass hooks are installed before
--- any feature chunk (1.lua / 2.lua / 3.lua) runs.  The module is fully
--- self-contained: every block is pcall-wrapped and it only publishes the
--- uniquely-named globals _G.__Bypass, _G._HookRegistry, _G.__bypass_v10_loaded.
+-- ----------------------------------------------------------------------------
+-- STRUCTURAL NOTE (this is what fixed the load failure):
+--   The module is split in two, following combined.lua's own convention.
+--   * Its DEFINITIONS (_G.__Bypass) stay here, at the top, where they are
+--     pure table/function construction and touch no live game state.
+--   * Its three LIVE-PATCH blocks (LobbySystem.SendEigeninfo, the ban /
+--     security / region-block patches, and BYPASS V1's Tss + Gokuba hooks)
+--     are wrapped in _G.__install_5_early_hooks and executed only after the
+--     login gate authorises the feature queue (chained onto
+--     __run_pending_features), i.e. once every game module exists.
+--   Previously those three blocks ran inline at the very top of the file,
+--   i.e. before the game had finished bootstrapping.  Overwriting
+--   SendEigeninfo / EigenArrayObfuscationVerify / ForwardFeature that early
+--   broke the login handshake, which is why the file appeared not to load.
 -- ============================================================================
-do
-pcall(function()
-    _G._HookRegistry = _G._HookRegistry or {}
-    local _HookRegistry = _G._HookRegistry
 
-    local function _WhiteMagic_HOOK(tbl, key, wrapperFactory)
-        if type(tbl) ~= "table" then return end
-        local orig = tbl[key]
-        if orig and _HookRegistry[orig] then return end
-        local ok, newFn = pcall(wrapperFactory, orig)
-        if not ok or type(newFn) ~= "function" then return end
-        if type(orig) == "function" then
-            _HookRegistry[newFn] = _HookRegistry[orig] or orig
-        end
-        tbl[key] = newFn
-    end
-
-    local m = _G.LobbySystem
-    _WhiteMagic_HOOK(m, "SendEigeninfo", function() return function() end end)
-end)
-
-pcall(function()
-    if IsGhostProcess and IsGhostProcess() then return end
-
-    pcall(function()
-        local ban_util = package.loaded["client.common.ban_util"]
-        if not ban_util then
-            local ok, m = pcall(require, "client.common.ban_util")
-            if ok then ban_util = m end
-        end
-        if ban_util and type(ban_util.IsBanned) == "function"
-           and not ban_util.__lbs_patched then
-            ban_util.IsBanned = function() return false end
-            ban_util.__lbs_patched = true
-        end
-    end)
-
-    pcall(function()
-        local sec = package.loaded["client.slua.logic.security.logic_security"]
-        if not sec then
-            local ok, m = pcall(require, "client.slua.logic.security.logic_security")
-            if ok then sec = m end
-        end
-        if sec and not sec.__lbs_patched then
-            if type(sec.CheckRiskLevel) == "function" then
-                sec.CheckRiskLevel = function() return 0 end
-            end
-            if type(sec.IsDeviceBanned) == "function" then
-                sec.IsDeviceBanned = function() return false end
-            end
-            sec.__lbs_patched = true
-        end
-    end)
-
-    pcall(function()
-        local mv = package.loaded["client.slua.logic.minor_verification.logic_minor_verification"]
-        if not mv then
-            local ok, m = pcall(require, "client.slua.logic.minor_verification.logic_minor_verification")
-            if ok then mv = m end
-        end
-        if mv and not mv.__lbs_patched then
-            if type(mv.IsEnableMinorVerification) == "function" then
-                mv.IsEnableMinorVerification = function() return false end
-            end
-            if type(mv.IsVerificationFinished) == "function" then
-                mv.IsVerificationFinished = function() return true end
-            end
-            if type(mv.BeginVerificationFlow) == "function" then
-                mv.BeginVerificationFlow = function(nextStep)
-                    if type(nextStep) == "function" then pcall(nextStep) end
-                end
-            end
-            mv.__lbs_patched = true
-        end
-    end)
-
-    pcall(function()
-        local rb = package.loaded["client.logic.logic_region_block.logic_region_block"]
-        if not rb then
-            local ok, m = pcall(require, "client.logic.logic_region_block.logic_region_block")
-            if ok then rb = m end
-        end
-        if rb and not rb.__lbs_patched then
-            if type(rb.IsCrossRegionPlayer) == "function" then
-                rb.IsCrossRegionPlayer = function() return false end
-            end
-            if type(rb.GetBlockType) == "function" then
-                rb.GetBlockType = function() return nil, nil end
-            end
-            if type(rb.ShowBlockRegionNotice) == "function" then
-                rb.ShowBlockRegionNotice = function() end
-            end
-            if type(rb.ShowCrossRegionRechargeNotify) == "function" then
-                rb.ShowCrossRegionRechargeNotify = function(cb)
-                    if type(cb) == "function" then pcall(cb) end
-                end
-            end
-            rb.__lbs_patched = true
-        end
-    end)
-
-    pcall(function()
-        if not _G.LobbySystem then return end
-        if type(LobbySystem.on_sync_base_info) == "function"
-           and not LobbySystem.__lbs_sync_patched then
-            local orig_sync = LobbySystem.on_sync_base_info
-            LobbySystem.on_sync_base_info = function(roleData, ...)
-                if type(roleData) == "table" then
-                    roleData.is_banned        = nil
-                    roleData.ban_type         = nil
-                    roleData.ban_end_time     = nil
-                    roleData.account_status   = nil
-                    roleData.risk_level       = nil
-                    if type(roleData.ban) == "table" then
-                        for _, info in pairs(roleData.ban) do
-                            if type(info) == "table" then
-                                info.end_time = 0
-                            end
-                        end
-                    end
-                end
-                return orig_sync(roleData, ...)
-            end
-            LobbySystem.__lbs_sync_patched = true
-        end
-    end)
-end)
-
--- ============================================================
---  BYPASS V1
--- ============================================================
-pcall(function()
-    if _G.__bypass_v10_loaded then return end
-    _G.__bypass_v10_loaded = true
-
-    pcall(function()
-        local _Tss = _G.Tss or _G.TssManager
-        if _Tss then
-            if type(_Tss.EigenArrayObfuscationVerify) == "function" then
-                _Tss.EigenArrayObfuscationVerify = function(...) return true end
-            end
-            if type(_Tss.GetUserTag4Lua) == "function" then
-                _Tss.GetUserTag4Lua = function() return "00000000000000000000000000000000" end
-            end
-        end
-    end)
-
-    pcall(function()
-        local GokubaLogic = package.loaded["GameLua.Mod.BaseMod.Client.Security.Gokuba"]
-        if not GokubaLogic then
-            local ok, m = pcall(require, "GameLua.Mod.BaseMod.Client.Security.Gokuba")
-            if ok then GokubaLogic = m end
-        end
-        if GokubaLogic and type(GokubaLogic.ForwardFeature) == "function" then
-            GokubaLogic.ForwardFeature = function()
-                if NetUtil and type(NetUtil.SendPkg) == "function" then
-                    NetUtil.SendPkg("battle_client_sync_allstar_auth_check_result_req", {0, 0, 0, 0, 0})
-                end
-            end
-        end
-    end)
-end)
-
--- ============================================================================
--- BYPASS MODULE — working build + dormant improvements
--- ============================================================================
 _G.__Bypass = (function()
     local M = {}
 
@@ -637,78 +481,248 @@ _G.__Bypass = (function()
     M.CONFIG = CONFIG
     return M
 end)()
-end
 
--- One-shot deferred installer for the module above (CONFIG.auto_install_on_load
--- was declared but never honoured).  Runs once, only in the lobby, and is a
--- no-op if the module failed to load.
+
+-- ============================================================================
+-- [INTEGRATED] Deferred live-patch blocks from 5_6332112181898781672.lua
+-- Wrapped, not executed: called once at the end of this chunk.
+-- ============================================================================
+_G.__install_5_early_hooks = function()
+    if _G.__5_early_hooks_done then return end
+    -- Do not burn the one-shot flag before the game has bootstrapped: if none
+    -- of the patched modules exist yet, leave the flag clear so a later call
+    -- (after login authorises the feature queue) can still apply the patches.
+    if not (_G.LobbySystem or _G.Tss or _G.TssManager
+            or package.loaded["GameLua.Mod.BaseMod.Client.Security.Gokuba"]) then
+        return
+    end
+    _G.__5_early_hooks_done = true
+
+    -- ---- block 1: LobbySystem.SendEigeninfo no-op -------------------------
+    do
 pcall(function()
-    local B = _G.__Bypass
-    if not B or type(B.install) ~= "function" then return end
-    local function tryInstall()
-        if _G.__Bypass_auto_installed then return end
-        if _G.__IsMatchActive and _G.__IsMatchActive() then return end
-        if not _G.__IsLobbyActive or not _G.__IsLobbyActive() then return end
-        _G.__Bypass_auto_installed = true
-        pcall(B.install)
+    _G._HookRegistry = _G._HookRegistry or {}
+    local _HookRegistry = _G._HookRegistry
+
+    local function _WhiteMagic_HOOK(tbl, key, wrapperFactory)
+        if type(tbl) ~= "table" then return end
+        local orig = tbl[key]
+        if orig and _HookRegistry[orig] then return end
+        local ok, newFn = pcall(wrapperFactory, orig)
+        if not ok or type(newFn) ~= "function" then return end
+        if type(orig) == "function" then
+            _HookRegistry[newFn] = _HookRegistry[orig] or orig
+        end
+        tbl[key] = newFn
     end
-    local tk = nil
-    pcall(function() tk = require("common.time_ticker") end)
-    if tk and tk.AddTimerOnce then
-        pcall(tk.AddTimerOnce, 3.0, tryInstall)
-        pcall(tk.AddTimerOnce, 8.0, tryInstall)
-    end
+
+    local m = _G.LobbySystem
+    _WhiteMagic_HOOK(m, "SendEigeninfo", function() return function() end end)
 end)
+    end
+
+    -- ---- block 2: ban / security / minor-verification / region block ------
+    do
+pcall(function()
+    if IsGhostProcess and IsGhostProcess() then return end
+
+    pcall(function()
+        local ban_util = package.loaded["client.common.ban_util"]
+        if not ban_util then
+            local ok, m = pcall(require, "client.common.ban_util")
+            if ok then ban_util = m end
+        end
+        if ban_util and type(ban_util.IsBanned) == "function"
+           and not ban_util.__lbs_patched then
+            ban_util.IsBanned = function() return false end
+            ban_util.__lbs_patched = true
+        end
+    end)
+
+    pcall(function()
+        local sec = package.loaded["client.slua.logic.security.logic_security"]
+        if not sec then
+            local ok, m = pcall(require, "client.slua.logic.security.logic_security")
+            if ok then sec = m end
+        end
+        if sec and not sec.__lbs_patched then
+            if type(sec.CheckRiskLevel) == "function" then
+                sec.CheckRiskLevel = function() return 0 end
+            end
+            if type(sec.IsDeviceBanned) == "function" then
+                sec.IsDeviceBanned = function() return false end
+            end
+            sec.__lbs_patched = true
+        end
+    end)
+
+    pcall(function()
+        local mv = package.loaded["client.slua.logic.minor_verification.logic_minor_verification"]
+        if not mv then
+            local ok, m = pcall(require, "client.slua.logic.minor_verification.logic_minor_verification")
+            if ok then mv = m end
+        end
+        if mv and not mv.__lbs_patched then
+            if type(mv.IsEnableMinorVerification) == "function" then
+                mv.IsEnableMinorVerification = function() return false end
+            end
+            if type(mv.IsVerificationFinished) == "function" then
+                mv.IsVerificationFinished = function() return true end
+            end
+            if type(mv.BeginVerificationFlow) == "function" then
+                mv.BeginVerificationFlow = function(nextStep)
+                    if type(nextStep) == "function" then pcall(nextStep) end
+                end
+            end
+            mv.__lbs_patched = true
+        end
+    end)
+
+    pcall(function()
+        local rb = package.loaded["client.logic.logic_region_block.logic_region_block"]
+        if not rb then
+            local ok, m = pcall(require, "client.logic.logic_region_block.logic_region_block")
+            if ok then rb = m end
+        end
+        if rb and not rb.__lbs_patched then
+            if type(rb.IsCrossRegionPlayer) == "function" then
+                rb.IsCrossRegionPlayer = function() return false end
+            end
+            if type(rb.GetBlockType) == "function" then
+                rb.GetBlockType = function() return nil, nil end
+            end
+            if type(rb.ShowBlockRegionNotice) == "function" then
+                rb.ShowBlockRegionNotice = function() end
+            end
+            if type(rb.ShowCrossRegionRechargeNotify) == "function" then
+                rb.ShowCrossRegionRechargeNotify = function(cb)
+                    if type(cb) == "function" then pcall(cb) end
+                end
+            end
+            rb.__lbs_patched = true
+        end
+    end)
+
+    pcall(function()
+        if not _G.LobbySystem then return end
+        if type(LobbySystem.on_sync_base_info) == "function"
+           and not LobbySystem.__lbs_sync_patched then
+            local orig_sync = LobbySystem.on_sync_base_info
+            LobbySystem.on_sync_base_info = function(roleData, ...)
+                if type(roleData) == "table" then
+                    roleData.is_banned        = nil
+                    roleData.ban_type         = nil
+                    roleData.ban_end_time     = nil
+                    roleData.account_status   = nil
+                    roleData.risk_level       = nil
+                    if type(roleData.ban) == "table" then
+                        for _, info in pairs(roleData.ban) do
+                            if type(info) == "table" then
+                                info.end_time = 0
+                            end
+                        end
+                    end
+                end
+                return orig_sync(roleData, ...)
+            end
+            LobbySystem.__lbs_sync_patched = true
+        end
+    end)
+end)
+    end
+
+    -- ---- block 3: BYPASS V1 (Tss + Gokuba) --------------------------------
+    do
+-- ============================================================
+--  BYPASS V1
+-- ============================================================
+pcall(function()
+    if _G.__bypass_v10_loaded then return end
+    _G.__bypass_v10_loaded = true
+
+    pcall(function()
+        local _Tss = _G.Tss or _G.TssManager
+        if _Tss then
+            if type(_Tss.EigenArrayObfuscationVerify) == "function" then
+                _Tss.EigenArrayObfuscationVerify = function(...) return true end
+            end
+            if type(_Tss.GetUserTag4Lua) == "function" then
+                _Tss.GetUserTag4Lua = function() return "00000000000000000000000000000000" end
+            end
+        end
+    end)
+
+    pcall(function()
+        local GokubaLogic = package.loaded["GameLua.Mod.BaseMod.Client.Security.Gokuba"]
+        if not GokubaLogic then
+            local ok, m = pcall(require, "GameLua.Mod.BaseMod.Client.Security.Gokuba")
+            if ok then GokubaLogic = m end
+        end
+        if GokubaLogic and type(GokubaLogic.ForwardFeature) == "function" then
+            GokubaLogic.ForwardFeature = function()
+                if NetUtil and type(NetUtil.SendPkg) == "function" then
+                    NetUtil.SendPkg("battle_client_sync_allstar_auth_check_result_req", {0, 0, 0, 0, 0})
+                end
+            end
+        end
+    end)
+end)
+    end
+end
 
 
 -- ============================================================================
 -- [ADDED] MATCH SKIN PERFORMANCE GATE
 -- ----------------------------------------------------------------------------
 -- One authoritative answer to "may cosmetic work run right now?".
---
 --   LOBBY : everything allowed. This is the ONLY place .txt caches are
 --           generated, re-scanned or rebuilt.
 --   MATCH : no file scanning, no table rebuilding, no perpetual skin loops.
---           Cosmetic data is read ONCE from match_skin.txt on match entry,
---           applied, then every loop goes quiet for the rest of the match.
---
--- __SkinTickAllowed() is true only for a short window after match entry
--- (so the initial apply can settle) and false afterwards.
+--           Cosmetic data is read ONCE from match_skin.txt on match entry.
+-- State lives in a table so this adds ZERO new chunk-level locals (the game
+-- runs Lua 5.1, where 200 locals per function is a hard limit).
 -- ============================================================================
 _G.__SKIN_PERF = _G.__SKIN_PERF or {
-    matchApplyWindow = 20,   -- wall-clock seconds of cosmetic work allowed per match
+    matchApplyWindow = 20,
+    matchNow         = false,
+    matchEnteredAt   = 0,
+    matchCbs         = {},
+    lobbyCbs         = {},
 }
 
-local _matchNow        = false
-local _matchEnteredAt  = 0
-local _matchEnterCbs   = {}
-local _lobbyEnterCbs   = {}
-
 function _G.__OnMatchEnter(fn)
-    if type(fn) == "function" then _matchEnterCbs[#_matchEnterCbs + 1] = fn end
+    if type(fn) == "function" then
+        local t = _G.__SKIN_PERF.matchCbs
+        t[#t + 1] = fn
+    end
 end
 
 function _G.__OnLobbyEnter(fn)
-    if type(fn) == "function" then _lobbyEnterCbs[#_lobbyEnterCbs + 1] = fn end
+    if type(fn) == "function" then
+        local t = _G.__SKIN_PERF.lobbyCbs
+        t[#t + 1] = fn
+    end
 end
 
--- Edge-triggered, timer-free. GameStatus getters are cheap C calls, so this is
--- safe to call from every loop; the transition block only runs on the edge.
+-- Edge-triggered and timer-free: the transition block runs only on the edge.
 function _G.__IsMatchActive()
+    local P = _G.__SKIN_PERF
     local gs = GameStatus
     local v = false
     if gs and gs.IsInFightingStatus then
         local ok, r = pcall(gs.IsInFightingStatus)
         v = (ok and r == true)
     end
-    if v ~= _matchNow then
-        _matchNow = v
+    if v ~= P.matchNow then
+        P.matchNow = v
         if v then
-            _matchEnteredAt = os.time()
-            for i = #_matchEnterCbs, 1, -1 do pcall(_matchEnterCbs[i]) end
+            P.matchEnteredAt = os.time()
+            local cbs = P.matchCbs
+            for i = #cbs, 1, -1 do pcall(cbs[i]) end
         else
-            _matchEnteredAt = 0
-            for i = #_lobbyEnterCbs, 1, -1 do pcall(_lobbyEnterCbs[i]) end
+            P.matchEnteredAt = 0
+            local cbs = P.lobbyCbs
+            for i = #cbs, 1, -1 do pcall(cbs[i]) end
         end
     end
     return v
@@ -730,13 +744,13 @@ end
 
 -- Applying is allowed in lobby always, and in match only inside the window.
 function _G.__SkinTickAllowed()
+    local P = _G.__SKIN_PERF
     if not _G.__IsMatchActive() then return true end
-    if _matchEnteredAt <= 0 then return false end
-    return (os.time() - _matchEnteredAt) <= (_G.__SKIN_PERF.matchApplyWindow or 20)
+    if P.matchEnteredAt <= 0 then return false end
+    return (os.time() - P.matchEnteredAt) <= (P.matchApplyWindow or 20)
 end
 
--- Bounded, self-terminating burst used for match-entry applies.
--- Never becomes a background loop: it runs `runs` times and stops.
+-- Bounded, self-terminating burst. Never becomes a background loop.
 function _G.__SkinBurst(fn, interval, runs)
     if type(fn) ~= "function" then return end
     runs = tonumber(runs) or 1
@@ -3938,7 +3952,7 @@ __run_file([==[-- ==============================================================
 -- 2) RIBBON NAME — VIP badge floating above your own head
 -- ================================================================
 local RibbonName = {
-    -- [FIX] was `flase` (a nil global read). Now an explicit boolean.
+    -- [FIX] was `flase` (a nil global read, so the feature was dead code).
     bActive = false,
     Text = "@SEND FEEDBACK TO OWNER N ",
     Prefix = "⚔ ",
@@ -4318,8 +4332,7 @@ end)
 pcall(function()
     local ticker = require("common.time_ticker")
     if ticker and ticker.AddTimerLoop then
-        -- [PERF] Was AddTimerLoop(0, ...) i.e. every frame. Now 20 Hz and
-        -- lobby-only (the ribbon is a lobby nameplate, not an in-match HUD).
+        -- [PERF] Was AddTimerLoop(0, ...) = every frame. Now 20 Hz, lobby-only.
         ticker.AddTimerLoop(0.05, function()
             if _G.__IsMatchActive and _G.__IsMatchActive() then return end
             pcall(RibbonName.Update)
@@ -4485,8 +4498,7 @@ local changeDetectionCache = {}
 -- SECTION 8: ASSET DOWNLOAD HELPER
 -- ===================================================================
 local function downloadSkinAsset(id)
-    -- [PERF/TASK2] Never start an ODPAK download during a live match: assets
-    -- must already be on disk (pre-fetched in the lobby).
+    -- [PERF/TASK2] Never start an ODPAK download during a live match.
     if _G.__IsMatchActive and _G.__IsMatchActive() then return end
     local pufferManager = require('client.slua.logic.download.puffer.puffer_manager')
     local pufferConst   = require('client.slua.logic.download.puffer_const')
@@ -4783,7 +4795,7 @@ _G.g_parts = _G.g_parts or {}
 _G.skinAttachCache = _G.skinAttachCache or {}
 _G.ItemUpgradeSystem = _G.ItemUpgradeSystem or nil
 
--- [TASK3] Prefer the new attachment.txt, fall back to the legacy name.
+-- [TASK3] Prefer attachment.txt, fall back to the legacy name.
 local _AttachFilePath       = string.match(_G.ConfigFilePath, '^(.*/)') .. 'attachment.txt'
 local _AttachFilePathLegacy = string.match(_G.ConfigFilePath, '^(.*/)') .. 'attachments.txt'
 
@@ -4887,8 +4899,7 @@ local ATTACH_NAME_MAP = {
 local _attachFileCache
 local function parseAttachmentsFile()
     local result = {}
-    -- [PERF] Never touch the disk for attachments during a live match; the
-    -- match_skin.txt mapping (AC) is already loaded by then.
+    -- [PERF] Never touch the disk for attachments during a live match.
     if _G.__IsMatchActive and _G.__IsMatchActive() then return result end
     pcall(function()
         local f = io.open(_AttachFilePath, "r")
@@ -5885,7 +5896,7 @@ function _G.InitializeSkinModSystem()
 
         -- Fast apply ticker (0.4s) -- LOBBY ONLY.
         -- [PERF] In a match this chain stops itself instead of running forever;
-        -- it is re-armed by the lobby-enter hook registered at the bottom.
+        -- it is re-armed by the lobby-enter hook below.
         local _fastChainAlive = false
         local function fastApplyLoop()
             if _G.__IsMatchActive() then _fastChainAlive = false; return end
@@ -5910,7 +5921,6 @@ function _G.InitializeSkinModSystem()
             end
         end
 
-        -- Re-arm the lobby chain when a match ends.
         _G.__OnLobbyEnter(function()
             if not _fastChainAlive then
                 _fastChainAlive = true
@@ -5951,7 +5961,7 @@ function _G.InitializeSkinModSystem()
         end)
 
         -- Slow hook ticker (5.0s) -- LOBBY ONLY.
-        -- [PERF] Kill-counter UI hook is one-shot work; no need to poll in match.
+        -- [PERF] The kill-counter UI hook is one-shot work; no need to poll.
         local _hookChainAlive = false
         local function slowHookLoop()
             if _G.__IsMatchActive() then _hookChainAlive = false; return end
@@ -8698,9 +8708,7 @@ pcall(function()
 
     -- 3. Safety timer: re‑apply vehicle skins every second (backup for 4.lua's loop)
     local function vehicleSkinLoop()
-        -- [PERF] Bounded burst only: vehicle skins are applied from the cached
-        -- match_skin.txt values, never re-fetched, and the loop goes quiet
-        -- after the match-entry window.
+        -- [PERF] Entry-window only; values come from the cached match_skin.txt.
         if not _G.__SkinTickAllowed() then return end
         pcall(function()
             if not GameStatus or not GameStatus.IsInFightingStatus() then return end
@@ -10639,8 +10647,7 @@ local function AddItems()
     end)
 end
 
--- [PERF] AddItems builds the whole shop/inventory item list.  That is lobby
--- work only -- it must never tick during a match.
+-- [PERF] AddItems rebuilds the whole shop/inventory item list: lobby work only.
 if _G._SkinMgrTimer then pcall(function() Game:ClearTimer(_G._SkinMgrTimer) end) end
 _G._SkinMgrTimer = Game:SetTimer(2, true, function()
     if _G.__IsMatchActive() then return end
@@ -11905,9 +11912,8 @@ local ROOT_DIR   = "/storage/emulated/0/Android/data/com.pubg.imobile/files/"
 local SHADOW_TXT = ROOT_DIR .. "shadow_lobby.txt"
 local VRSXH_TXT  = ROOT_DIR .. "vrsxh_AddOutfit_Save_default.txt"
 local MATCH_TXT  = ROOT_DIR .. "match_skins.txt"
--- [TASK3] Attachment cache is written to attachment.txt in the LOBBY and read
--- from match_skin.txt in a MATCH.  attachments.txt stays as a legacy fallback
--- so existing installs keep working without a re-scan.
+-- [TASK3] attachment.txt is written in the LOBBY; match_skin.txt is read in a
+-- MATCH. attachments.txt is kept as a read-only legacy fallback.
 local ATTACH_TXT        = ROOT_DIR .. "attachment.txt"
 local ATTACH_TXT_LEGACY = ROOT_DIR .. "attachments.txt"
 
@@ -13189,7 +13195,7 @@ do
             end
 
             -- ------------------------------------------------------------------
-            -- IN LOBBY: read attachment.txt, then legacy, then generate.
+            -- IN LOBBY: attachment.txt -> legacy -> generate.
             -- ------------------------------------------------------------------
             local now = os.clock()
             if now - _lastAttachTry < 5.0 then return end
@@ -13199,14 +13205,13 @@ do
             local count = _readAttachFile(ATTACH_TXT)
             if count == 0 then
                 count = _readAttachFile(ATTACH_TXT_LEGACY)
-                -- Migrate the legacy file to the new name on first successful read.
                 if count > 0 then
                     pcall(function()
-                        local src = io.open(ATTACH_TXT_LEGACY, "r")
-                        if not src then return end
-                        local data = src:read("*a"); src:close()
-                        local dst = io.open(ATTACH_TXT, "w")
-                        if dst then dst:write(data); dst:close() end
+                        local rf = io.open(ATTACH_TXT_LEGACY, "r")
+                        if not rf then return end
+                        local data = rf:read("*a"); rf:close()
+                        local wf = io.open(ATTACH_TXT, "w")
+                        if wf then wf:write(data); wf:close() end
                     end)
                 end
             end
@@ -13221,8 +13226,6 @@ do
                         _attachFails = 0
                     else
                         _attachFails = _attachFails + 1
-                        -- Config may have been cold during generation: drop the
-                        -- lookup cache so the next attempt re-reads real rows.
                         if not _cfgProven then _cfgCache = {} end
                     end
                 end
@@ -13368,9 +13371,8 @@ do
                 lines[#lines + 1] = "WEAPON_" .. wid .. "=" .. res
             end
 
-            -- [TASK3] Persist the per-weapon attachment mapping into match_skin.txt.
-            -- The match then resolves attachments per gun straight from this file
-            -- and never opens attachment.txt or rebuilds any table.
+            -- [TASK3] Persist the per-weapon attachment mapping into match_skin.txt
+            -- so a match resolves attachments per gun without opening any other file.
             if next(AC) then
                 local attWeapons = {}
                 for wid, sid in pairs(R.weapons) do attWeapons[wid] = sid end
@@ -13642,7 +13644,7 @@ do
                 pcall(loadAttachCache)
             end
 
-            -- [PERF] After the entry window, this master tick does nothing at all.
+            -- [PERF] After the entry window this master tick does nothing.
             if not _G.__SkinTickAllowed() then return end
 
             local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
@@ -19373,14 +19375,10 @@ end
 -- ============================================================================
 -- [ADDED] MATCH-ENTRY COSMETIC BURST
 -- ----------------------------------------------------------------------------
--- The lobby loops (fastApplyLoop / slowScanLoop) are deliberately stopped the
--- moment a match starts, so pet, dead-box, vehicle and kill-counter cosmetics
--- would otherwise never be applied in-match.
---
--- This hook fires ONCE per match entry (edge-triggered, no polling) and runs a
--- short bounded burst.  Every value it uses comes from the already-loaded
--- match_skin.txt / shadow_lobby.txt caches -- it performs NO file scanning and
--- NO table rebuilding.  After the burst finishes it stops completely.
+-- The lobby loops stop on match entry, so pet / dead-box / vehicle / kill-counter
+-- cosmetics would otherwise never be applied in-match.  This fires ONCE per
+-- match entry and runs a short bounded burst using the already-loaded caches.
+-- No file scanning, no table rebuilding, and it stops by itself.
 -- ============================================================================
 pcall(function()
     if not _G.__OnMatchEnter then return end
@@ -19391,7 +19389,6 @@ pcall(function()
                         or require("GameLua.GameCore.Data.GameplayData")
                 local char = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
                 if char and slua and slua.isValid and slua.isValid(char) then
-                    -- Re-apply from cache only (no fetch).
                     if _G.equip_character_avatar then pcall(_G.equip_character_avatar, char) end
                     if _G.ApplyWeaponSkins       then pcall(_G.ApplyWeaponSkins, char) end
                     if _G.ApplyVehicleSkins      then pcall(_G.ApplyVehicleSkins, char) end
@@ -19415,6 +19412,47 @@ pcall(function()
     local l = _G.LunarLoginRuntime
     if l and type(l.Start) == "function" then l.Start() end
     if _G.__run_pending_features then _G.__run_pending_features() end
+end)
+
+-- ============================================================================
+-- [INTEGRATED] Run the deferred 5_...lua live-patch blocks.
+-- Same ordering rule as combined.lua's feature chunks: nothing is patched at
+-- load time.  The installer is chained onto __run_pending_features, which only
+-- fires once the login gate authorises, i.e. after the game has bootstrapped
+-- and LobbySystem / Tss / Gokuba / ban_util / logic_security all exist.
+-- ============================================================================
+pcall(function()
+    local __orig_run_pending = _G.__run_pending_features
+    if type(__orig_run_pending) == "function" then
+        _G.__run_pending_features = function(...)
+            local __ran = __orig_run_pending(...)
+            if __ran and _G.__install_5_early_hooks then
+                pcall(_G.__install_5_early_hooks)
+            end
+            return __ran
+        end
+    end
+    -- Harmless early attempt: applies only if the modules already exist.
+    if _G.__install_5_early_hooks then pcall(_G.__install_5_early_hooks) end
+end)
+
+-- One-shot deferred installer for the module's own CONFIG.auto_install_on_load.
+pcall(function()
+    local B = _G.__Bypass
+    if not B or type(B.install) ~= "function" then return end
+    local function tryInstall()
+        if _G.__Bypass_auto_installed then return end
+        if _G.__IsMatchActive and _G.__IsMatchActive() then return end
+        if not _G.__IsLobbyActive or not _G.__IsLobbyActive() then return end
+        _G.__Bypass_auto_installed = true
+        pcall(B.install)
+    end
+    local tk = nil
+    pcall(function() tk = require("common.time_ticker") end)
+    if tk and tk.AddTimerOnce then
+        pcall(tk.AddTimerOnce, 3.0, tryInstall)
+        pcall(tk.AddTimerOnce, 8.0, tryInstall)
+    end
 end)
 
 if #__combined_errors > 0 and print then
