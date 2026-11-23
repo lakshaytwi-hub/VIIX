@@ -574,7 +574,7 @@ local MasterLicenseCore = (function()
     return Core
 end)()
 
-    local UI={Version="LunarUI.Lite.1"}
+    local UI={Version="LunarUI.V9.NativeGradient.2"}
     local function member(o,k)
         if o==nil then return nil end
         local ok,v=pcall(function() return o[k] end);if ok then return v end
@@ -609,23 +609,20 @@ end)()
         d.Submit=nil;d.Event=nil;d.Handle=nil;d.Container=nil;d.Parent=nil
         d.Input=nil;d.Button=nil;d.Status=nil;d.Title=nil;d.Detail=nil;d.Hint=nil;d.Design=nil;d.Cache=nil
     end
-    -- Lightweight flat panel: one backing, one header, one accent bar, text and
-    -- one button. No gradients, no occlusion clipping, no InvalidationBox.
+    -- Approved red/green frame, dark red/green heading, light full-color body.
+    -- All gradient/angle/brush work happens at construction. No animation,
+    -- background asset, network dependency, text outline or external backdrop.
     function UI.Build(kind,key,status,submit)
         local p=parent();if not p then return nil,"UI_NOT_READY" end
         local enums=UEnums.ESlateVisibility
         local passive=enums.SelfHitTestInvisible
         if enums.Visible==nil or passive==nil then return nil,"UI_ENUM_UNAVAILABLE" end
         local welcome=kind=="welcome"
-        local keyinfo=kind=="keyinfo"
-        local W,H
-        if keyinfo then W,H=520,168
-        elseif welcome then W,H=560,236
-        else W,H=470,222 end
-        local scale=1
+        local W,H=welcome and 600 or 500,welcome and 276 or 248
+        local scale=welcome and 0.8 or 1
         pcall(function()
             local v=p:GetCachedGeometry():GetLocalSize()
-            if v.X>24 and v.Y>24 then scale=math.min(1,(v.X-24)/W,(v.Y-24)/H) end
+            if v.X>24 and v.Y>24 then scale=math.min(scale,(v.X-24)/W,(v.Y-24)/H) end
         end)
         local d={Parent=p,Visible=false,Submit=submit,Scale=scale}
         local ok,buildError=pcall(function()
@@ -634,107 +631,247 @@ end)()
                 assert(valid(w),"UI_WIDGET_UNAVAILABLE");return w
             end
             d.Container=make("CanvasPanel",p)
-            local function add(w,x,y,ww,hh,z)
-                local slot=d.Container:AddChildToCanvas(w)
+            local design=make("CanvasPanel",d.Container);d.Design=design
+            local artRoot=design
+            local canCache,cache=pcall(make,"InvalidationBox",d.Container)
+            if canCache and valid(cache) and type(member(cache,"SetCanCache"))=="function" then
+                local attached=pcall(function()cache:AddChild(design);cache:SetCanCache(true);visibility(cache,passive)end)
+                if attached then artRoot=cache;d.Cache=cache end
+            end
+            local artSlot=d.Container:AddChildToCanvas(artRoot)
+            artSlot:SetAutoSize(false);artSlot:SetPosition(vector(0,0));artSlot:SetSize(vector(W,H));artSlot:SetZOrder(1)
+            visibility(design,passive)
+            local function add(w,x,y,ww,hh,z,dynamic)
+                local slot=(dynamic and d.Container or design):AddChildToCanvas(w)
                 slot:SetAutoSize(false);slot:SetPosition(vector(x,y));slot:SetSize(vector(ww,hh));slot:SetZOrder(z)
                 return slot
             end
-            -- Lite panel: flat solid fills only. No gradient columns, no
-            -- occlusion clipping, no InvalidationBox -> ~10 widgets per panel.
-            local function box(x,y,ww,hh,r,g,b,a,z)
+            -- Flatten static gradient rectangles before applying 50% alpha.
+            -- Overlapping body/badge/button fills must not accumulate opacity.
+            local artwork={}
+            local function drawRect(x,y,ww,hh,c,z,opacity)
                 local w=make("Border",d.Container)
-                w:SetBrushColor(color(r,g,b,a));visibility(w,passive);add(w,x,y,ww,hh,z)
-                return w
+                w:SetBrushColor(colorClass(c.R,c.G,c.B,opacity or .5));visibility(w,passive)
+                add(w,x,y,ww,hh,z);return w
+            end
+            local function rect(x,y,ww,hh,c,z,opacity)
+                artwork[#artwork+1]={X=x,Y=y,W=ww,H=hh,C=c,Z=z,A=opacity or .5,Order=#artwork+1}
+            end
+            local function renderArt()
+                table.sort(artwork,function(a,b)
+                    if a.Z==b.Z then return a.Order>b.Order end
+                    return a.Z>b.Z
+                end)
+                local covered={}
+                local function put(out,x,y,w,h)
+                    if w>.00001 and h>.00001 then out[#out+1]={X=x,Y=y,W=w,H=h} end
+                end
+                for _,shape in ipairs(artwork) do
+                    local pieces={{X=shape.X,Y=shape.Y,W=shape.W,H=shape.H}}
+                    for _,cover in ipairs(covered) do
+                        local nextPieces={}
+                        for _,piece in ipairs(pieces) do
+                            local x1=math.max(piece.X,cover.X);local y1=math.max(piece.Y,cover.Y)
+                            local x2=math.min(piece.X+piece.W,cover.X+cover.W)
+                            local y2=math.min(piece.Y+piece.H,cover.Y+cover.H)
+                            if x2<=x1 or y2<=y1 then nextPieces[#nextPieces+1]=piece
+                            else
+                                put(nextPieces,piece.X,piece.Y,piece.W,y1-piece.Y)
+                                put(nextPieces,piece.X,y2,piece.W,piece.Y+piece.H-y2)
+                                put(nextPieces,piece.X,y1,x1-piece.X,y2-y1)
+                                put(nextPieces,x2,y1,piece.X+piece.W-x2,y2-y1)
+                            end
+                        end
+                        pieces=nextPieces;if #pieces==0 then break end
+                    end
+                    -- Coalesce adjacent pieces of the same solid gradient strip.
+                    -- This keeps clipping from multiplying native UI widgets.
+                    local changed=true
+                    while changed do
+                        changed=false
+                        for i=1,#pieces do
+                            local a=pieces[i]
+                            for j=i+1,#pieces do
+                                local b=pieces[j]
+                                local vertical=math.abs(a.X-b.X)<.00001 and math.abs(a.W-b.W)<.00001
+                                    and (math.abs(a.Y+a.H-b.Y)<.00001 or math.abs(b.Y+b.H-a.Y)<.00001)
+                                local horizontal=math.abs(a.Y-b.Y)<.00001 and math.abs(a.H-b.H)<.00001
+                                    and (math.abs(a.X+a.W-b.X)<.00001 or math.abs(b.X+b.W-a.X)<.00001)
+                                if vertical or horizontal then
+                                    local x,y=math.min(a.X,b.X),math.min(a.Y,b.Y)
+                                    a.W=math.max(a.X+a.W,b.X+b.W)-x
+                                    a.H=math.max(a.Y+a.H,b.Y+b.H)-y;a.X=x;a.Y=y
+                                    table.remove(pieces,j);changed=true;break
+                                end
+                            end
+                            if changed then break end
+                        end
+                    end
+                    for _,piece in ipairs(pieces) do
+                        drawRect(piece.X,piece.Y,piece.W,piece.H,shape.C,shape.Z,shape.A)
+                    end
+                    covered[#covered+1]=shape
+                end
+                artwork=nil
+            end
+            local function sample(stops,t,opacity)
+                t=math.max(0,math.min(1,t));local a,b,u
+                if t<=.5 then a,b,u=stops[1],stops[2],t*2 else a,b,u=stops[2],stops[3],(t-.5)*2 end
+                return color(a[1]+(b[1]-a[1])*u,a[2]+(b[2]-a[2])*u,a[3]+(b[3]-a[3])*u,opacity)
+            end
+            local function panel(x,y,ww,hh,cut,stops,z,columns,opacity)
+                columns=math.min(columns,12) -- Static cached gradient geometry.
+                for i=0,columns-1 do
+                    local a=ww*i/columns;local b=ww*(i+1)/columns
+                    local inset=math.max(0,cut-math.min(a,ww-b))
+                    rect(x+a,y+inset,b-a,hh-inset*2,sample(stops,(i+.5)/columns,opacity),z,opacity)
+                end
+            end
+            local function rail(x,y,ww,hh,stops,z,columns)
+                columns=math.min(columns,12)
+                for i=0,columns-1 do
+                    rect(x+ww*i/columns,y,ww/columns,hh,sample(stops,(i+.5)/columns),z)
+                end
+            end
+            local function line(ax,ay,bx,by,th,c,z)
+                local dx,dy=bx-ax,by-ay
+                local len=math.sqrt(dx*dx+dy*dy)
+                if len<=0 then return end
+                local angle
+                if dx==0 then angle=dy>=0 and 90 or -90
+                else angle=math.atan(dy/dx)*180/math.pi;if dx<0 then angle=angle+180 end end
+                local w=drawRect((ax+bx-len)/2,(ay+by-th)/2,len,th,c,z,z>=7 and 1 or .5)
+                w:SetRenderTransformPivot(vector(.5,.5));w:SetRenderAngle(angle)
             end
             local slate=import("SlateColor")
+            local fontObject
+            if slua and type(slua.loadObject)=="function" then
+                local loaded,obj=pcall(slua.loadObject,"/Engine/EngineFonts/Roboto.Roboto")
+                if loaded and valid(obj) then fontObject=obj end
+            end
             local function style(w,size,c,bold)
                 local font=member(w,"Font")
                 if font then
                     if type(font)=="table" then local copy={};for k,v in pairs(font) do copy[k]=v end;font=copy end
                     font.Size=size
+                    if fontObject then font.FontObject=fontObject;font.TypefaceFontName=bold and "Bold" or "Regular" end
                     if font.OutlineSettings then
                         local outline=font.OutlineSettings
                         if type(outline)=="table" then local copy={};for k,v in pairs(outline) do copy[k]=v end;outline=copy end
                         outline.OutlineSize=0;font.OutlineSettings=outline
                     end
-                    pcall(function() w:SetFont(font) end)
+                    w:SetFont(font)
                 end
-                pcall(function() w:SetColorAndOpacity(slate(c)) end)
+                w:SetColorAndOpacity(slate(c))
+                pcall(function()w:SetShadowOffset(vector(0,0));w:SetShadowColorAndOpacity(color(0,0,0,0))end)
                 pcall(function() w:SetAutoWrapText(true) end)
             end
-            local function text(value,x,y,ww,hh,size,c,z,bold,center)
+            local function text(value,x,y,ww,hh,size,c,z,bold,center,dynamic)
                 local w=make("TextBlock",d.Container);w:SetText(value);style(w,size,c,bold)
-                visibility(w,passive);add(w,x,y,ww,hh,z)
+                visibility(w,passive);add(w,x,y,ww,hh,z,dynamic)
                 if center then pcall(function() w:SetJustification(1) end) end
                 return w
             end
+            local frame={{30,90,180},{25,70,150},{40,120,220}}
+            local bright={{100,170,255},{80,150,230},{120,190,255}}
+            local edge={{15,40,90},{20,50,100},{25,60,120}}
+            local body={{20,40,80},{25,50,95},{30,55,100}}
+            local header={{15,45,110},{20,55,130},{25,70,150}}
+            local gold={{40,120,220},{90,170,255},{50,140,240}}
             local white=color(255,255,255)
-            local accent=color(150,200,255)
-            local soft=color(190,215,255)
-            box(0,0,W,H,12,28,62,0.88,2)
-            box(2,2,W-4,54,18,44,104,0.95,3)
-            box(2,56,W-4,2,60,140,240,1,4)
-            if keyinfo then
-                d.Title=text("@VRSXH",14,8,W-28,34,20,white,6,true,true)
-                text("YOUR KEY",14,44,140,18,12,accent,6,false,false)
-                box(14,66,W-28,44,8,20,48,1,5)
-                d.KeyText=text(key or "",22,72,W-44,34,19,white,6,true,true)
-                d.Hint=text("Auto close in 5s",14,114,W-28,18,11,accent,6,false,false)
-            elseif welcome then
-                d.Title=text("Welcome to @VRSXH Lua mod",14,8,W-28,40,19,white,6,true,true)
-                box(30,72,W-60,50,20,60,140,1,5)
-                d.Detail=text("Kill limit 8-10",40,80,W-80,36,23,white,6,true,true)
-                d.Hint=text("Play smart and avoid report",20,132,W-40,28,16,soft,6,true,true)
+            local forest=color(160,200,255)
+            local burgundy=color(120,180,255)
+            -- Perimeter only: an opaque full-panel backing would destroy
+            -- the requested body transparency even with alpha on the body.
+            panel(6,6,W-12,H-12,10,body,2,24,.5)
+            rail(13,0,W-26,6,frame,3,24)
+            rail(13,H-6,W-26,6,frame,3,24)
+            rect(0,13,6,H-26,color(30,90,180),3)
+            rect(W-6,13,6,H-26,color(40,140,255),3)
+            rail(13,1,W-26,1.5,bright,3,24)
+            rail(13,H-3,W-26,1.5,edge,3,24)
+            rect(1,13,1.5,H-26,color(100,170,255),3)
+            rect(W-3,13,1.5,H-26,color(80,160,240),3)
+            for _,s in ipairs({{1,13,13,1},{1,H-13,13,H-1}}) do line(s[1],s[2],s[3],s[4],2,color(90,165,255),3) end
+            for _,s in ipairs({{W-13,1,W-1,13},{W-13,H-1,W-1,H-13}}) do line(s[1],s[2],s[3],s[4],2,color(70,150,230),3) end
+            panel(10,10,W-20,65,16,gold,4,24,1)
+            panel(13,13,W-26,59,14,header,5,32,1)
+            if welcome then
+                d.Title=text("Welcome to @VRSXH Lua mod",24,22,W-48,42,19,white,7,true,true)
+                local pw=math.min(340,W-72);local px=(W-pw)/2
+                panel(px,99,pw,51,12,gold,4,16)
+                panel(px+3,102,pw-6,45,10,{{20,60,140},{40,110,210},{25,80,170}},5,20)
+                d.Detail=text("Kill limit 8-10",px+16,109,pw-32,34,23,white,7,true,true)
+                d.Hint=text("Play smart and avoid report",30,165,W-60,32,17,forest,7,true,true)
             else
-                d.Title=text("@VRSXH",14,8,W-28,32,21,white,6,true,true)
-                text("LOGIN KEY",14,44,140,18,12,accent,6,false,false)
-                box(14,64,W-28,36,8,20,48,1,5)
+                d.Title=text("@VRSXH",22,15,W-44,31,24,white,7,true,true)
+                text("LOGIN",22,45,W-44,21,12,white,7,true,true)
+                line(W/2-118,56,W/2-47,56,1,color(140,190,255),7)
+                line(W/2+47,56,W/2+118,56,1,color(140,190,255),7)
+                text("LOGIN KEY",22,82,W-44,20,13,burgundy,7,true,false)
+                rail(27,104,W-54,2,gold,4,24)
+                rail(27,143,W-54,2,gold,4,24)
+                rect(20,111,2,27,color(40,120,220),4)
+                rect(W-22,111,2,27,color(50,140,240),4)
+                line(20,111,27,104,2,color(90,170,255),4)
+                line(W-27,104,W-20,111,2,color(90,170,255),4)
+                line(20,138,27,145,2,color(90,170,255),4)
+                line(W-27,145,W-20,138,2,color(90,170,255),4)
                 d.Input=make("EditableTextBox",d.Container)
                 d.Input:SetText(key or "")
+                -- Input-specific native style; TextBlock-only methods stay unused.
+                local fg=forest;local bg=color(20,40,90,0)
                 local inputStyle=member(d.Input,"WidgetStyle")
                 if inputStyle then
                     if type(inputStyle)=="table" then local copy={};for k,v in pairs(inputStyle) do copy[k]=v end;inputStyle=copy end
                     local inputFont=member(inputStyle,"Font")
                     if inputFont then
                         if type(inputFont)=="table" then local copy={};for k,v in pairs(inputFont) do copy[k]=v end;inputFont=copy end
-                        inputFont.Size=16;inputStyle.Font=inputFont
+                        inputFont.Size=17
+                        if fontObject then inputFont.FontObject=fontObject;inputFont.TypefaceFontName="Regular" end
+                        inputStyle.Font=inputFont
                     end
-                    inputStyle.ForegroundColor=slate(accent)
-                    inputStyle.ReadOnlyForegroundColor=slate(accent)
+                    inputStyle.ForegroundColor=slate(fg);inputStyle.ReadOnlyForegroundColor=slate(fg)
+                    for _,name in ipairs({"BackgroundImageNormal","BackgroundImageHovered","BackgroundImageFocused","BackgroundImageReadOnly"}) do
+                        local brush=member(inputStyle,name)
+                        if brush then
+                            if type(brush)=="table" then local copy={};for k,v in pairs(brush) do copy[k]=v end;brush=copy end
+                            brush.TintColor=slate(bg);inputStyle[name]=brush
+                        end
+                    end
                     d.Input.WidgetStyle=inputStyle
                 else
                     local inputFont=member(d.Input,"Font")
                     if inputFont then
                         if type(inputFont)=="table" then local copy={};for k,v in pairs(inputFont) do copy[k]=v end;inputFont=copy end
-                        inputFont.Size=16;d.Input.Font=inputFont
+                        inputFont.Size=17;d.Input.Font=inputFont
                     end
-                    d.Input.ForegroundColor=accent
+                    d.Input.ForegroundColor=fg;d.Input.BackgroundColor=bg
                 end
+                local setForeground=member(d.Input,"SetForegroundColor")
+                if type(setForeground)=="function" then setForeground(d.Input,fg) end
                 pcall(function() d.Input:SetHintText("Enter your key") end)
-                visibility(d.Input,enums.Visible);add(d.Input,18,66,W-36,32,6)
-                d.Hint=text("Your key is saved automatically",14,104,W-28,18,11,accent,6,false,false)
-                d.Status=text(status or "Enter your key",14,126,W-28,22,12,soft,6,false,false)
+                visibility(d.Input,enums.Visible);add(d.Input,23,107,W-46,35,8,true)
+                d.Hint=text("Your key is saved automatically",22,149,W-44,19,11,burgundy,7,false,false)
+                d.Status=text(status or "Enter your key",22,170,W-44,23,11,burgundy,8,false,false,true)
             end
-            local by=(keyinfo and 136) or (welcome and 176 or 158)
-            local bh=(keyinfo and 26) or 34
-            local bw=(keyinfo and 140) or 180
-            local bx=(W-bw)/2
             local button=make("Button",d.Container);d.Button=button
-            pcall(function() button:SetBackgroundColor(color(0,130,60,1)) end)
-            visibility(button,enums.Visible);add(button,bx,by,bw,bh,7)
-            local label=make("TextBlock",button);label:SetText("OK");style(label,16,white,true);visibility(label,passive)
+            local by=welcome and 212 or 201;local bh=welcome and 42 or 34
+            local bw=welcome and 202 or 190;local bx=(W-bw)/2
+            panel(bx-4,by-3,bw+8,bh+6,9,gold,4,16)
+            panel(bx,by,bw,bh,8,{{0,112,51},{1,149,68},{0,99,46}},5,16)
+            pcall(function() button:SetBackgroundColor(color(255,255,255,0)) end)
+            visibility(button,enums.Visible)
+            local label=make("TextBlock",button);label:SetText("OK");style(label,17,white,true);visibility(label,passive)
             local labelSlot=button:AddChild(label)
             pcall(function() labelSlot:SetHorizontalAlignment(2);labelSlot:SetVerticalAlignment(2) end)
+            add(button,bx,by,bw,bh,9,true)
             d.Event=button.OnClicked
             d.Handle=d.Event:Add(function()
                 if not d.Visible or d.Busy then return end
-                if welcome or keyinfo then
+                if welcome then
                     destroy(d);d.Dismissed=true
-                    local l=_G.LunarLoginRuntime
-                    if l then
-                        if l.WelcomeUI==d then l.WelcomeUI=nil end
-                        if l.KeyUI==d then l.KeyUI=nil end
-                    end
+                    local l=_G.LunarLoginRuntime;if l and l.WelcomeUI==d then l.WelcomeUI=nil end
                     return
                 end
                 local okRead,k=pcall(function() return d.Input:GetText() end)
@@ -743,6 +880,7 @@ end)()
                 if #k==0 or #k>512 then d.Status:SetText("Enter a valid key");return end
                 if d.Submit then d.Submit(k) end
             end)
+            renderArt()
             local slot=p:AddChildToCanvas(d.Container);slot:SetAutoSize(false);slot:SetSize(vector(W,H));slot:SetZOrder(9200)
             local anchors=slot:GetAnchors();anchors.Minimum=vector(.5,.5);anchors.Maximum=vector(.5,.5)
             slot:SetAnchors(anchors);slot:SetAlignment(vector(.5,.5));slot:SetPosition(vector(0,0))
@@ -780,7 +918,7 @@ end)()
         L.UIFactory=UI
         -- Identity is pinned independently of the feature-settings location.
         -- All IO is bounded and happens at startup/login, or a delayed save retry.
-        local paths=g_VRSXH_ESPSettingsPaths()
+        local paths=g_@VRSXH_ESPSettingsPaths()
         for i,path in ipairs(paths) do paths[i]=path:gsub("MASTERPIECE_UMG_ESP_settings.lua$","MASTERAHSAN_LOGIN_V7_settings.lua") end
         local function loginPath(featurePath)
             if type(featurePath)~="string" then return nil end
@@ -887,7 +1025,7 @@ end)()
             if current and current.Checked and current.Seed==seed and current.Key==key then return true end
             if state=="unreadable" or state=="other_scope" then return false end
             if current and current.Seed~=seed and (identity or not L.HasIdentityRecord) then return false end
-            local ok=g_VRSXH_ESPWriteSettings(path,data)
+            local ok=g_@VRSXH_ESPWriteSettings(path,data)
             if not ok then return false end
             local result=readRecord(path,identity)
             return result~=nil and result.Checked and result.Seed==seed and result.Key==key
@@ -947,10 +1085,7 @@ end)()
             assert(saved or L.IdentityPersisted,"DEVICE_CACHE_SAVE_FAILED")
         end
         recover()
-        L.DestroyUI=function()
-            destroy(L.LoginUI);destroy(L.WelcomeUI);destroy(L.KeyUI)
-            L.LoginUI=nil;L.WelcomeUI=nil;L.KeyUI=nil
-        end
+        L.DestroyUI=function() destroy(L.LoginUI);destroy(L.WelcomeUI);L.LoginUI=nil;L.WelcomeUI=nil end
         local function wake()
             local f=_G.LunarFeatures;if f and f.Wake and not f.Token.Stopped then f.Wake() end
         end
@@ -964,17 +1099,7 @@ end)()
             end,
             decode=function(raw) local json=require("common.json_util");return json.decode(raw) end,
             post=function(url,headers,body,callback,timeout)
-                local MM=ModuleManager
-                if not MM then
-                    pcall(function() MM=require("client.module_framework.ModuleManager") end)
-                end
-                if not MM or type(MM.GetModule)~="function" then
-                    error("HTTP_MANAGER_UNAVAILABLE")
-                end
-                local http=MM.GetModule(MM.CommonModuleConfig.http_manager)
-                if not http or type(http.Post)~="function" then
-                    error("HTTP_MANAGER_UNAVAILABLE")
-                end
+                local http=ModuleManager.GetModule(ModuleManager.CommonModuleConfig.http_manager)
                 L.Diagnostics.HTTP=L.Diagnostics.HTTP+1
                 return http:Post(url,headers,body,nil,callback,timeout)
             end,
@@ -982,11 +1107,7 @@ end)()
                 L.Status=message;L.Pending=phase=="pending"
                 if phase=="active" then
                     L.Authorized=true;L.Key=L.AttemptKey or L.Key;L.Save()
-                    -- The player just typed the key, so skip the reminder popup
-                    -- for this login. It still appears once after a restart.
-                    L.KeyShown=true;L.KeyPopupDone=true
                     destroy(L.LoginUI);L.LoginUI=nil
-                    pcall(function() if _G.__run_pending_features then _G.__run_pending_features() end end)
                 else L.Authorized=false end
                 L.NeedsUpdate=true
                 local d=L.LoginUI
@@ -1015,29 +1136,6 @@ end)()
             if L.Pending then L.Auth.Tick() end
             if L.Dirty and (not L.SaveRetryAt or os.time()>=L.SaveRetryAt or os.time()<L.SaveRetryAt-30) then L.Save() end
             if L.Authorized then
-                -- Idle fast path: nothing left to draw, so skip the UI lookup.
-                if L.KeyPopupDone and L.WelcomeShown then L.NeedsUpdate=false;return end
-                -- Key reminder: after a full game restart the saved session is
-                -- restored silently, so show the stored key once for ~5s.
-                if L.KeyUI and not valid(L.KeyUI.Container) then L.KeyUI=nil end
-                if not L.KeyPopupDone then
-                    if not L.KeyShownAt then L.KeyShownAt=os.clock() end
-                    if L.KeyUI then
-                        if os.clock()-L.KeyShownAt>=5 then
-                            destroy(L.KeyUI);L.KeyUI=nil;L.KeyPopupDone=true
-                        else
-                            L.NeedsUpdate=true;return
-                        end
-                    elseif os.clock()-L.KeyShownAt<5 then
-                        local d=UI.Build("keyinfo",L.Key~="" and L.Key or "Saved key on this device")
-                        if d then
-                            L.KeyUI=d;L.KeyShown=true;L.NeedsUpdate=true
-                            return
-                        end
-                    else
-                        L.KeyPopupDone=true
-                    end
-                end
                 if not L.WelcomeShown then
                     local d=UI.Build("welcome")
                     if d then L.WelcomeUI=d;L.WelcomeShown=true end
@@ -1045,83 +1143,16 @@ end)()
                 L.NeedsUpdate=not L.WelcomeShown or L.Dirty
                 return
             end
-            if L.LoginUI and not valid(L.LoginUI.Container) then destroy(L.LoginUI);L.LoginUI=nil end
+            local p=parent()
+            if L.LoginUI and (not valid(L.LoginUI.Container) or p~=L.LoginUI.Parent) then destroy(L.LoginUI);L.LoginUI=nil end
             if not L.LoginUI then
-                -- Locked state: build immediately so the key page is never late.
-                local p=parent()
-                if p then
-                    local d=UI.Build("login",L.Key,L.Status,L.Login)
-                    if d then
-                        d.Busy=L.Pending;d.StatusText=L.Status;L.LoginUI=d
-                        pcall(function() d.Input:SetIsEnabled(not L.Pending);d.Button:SetIsEnabled(not L.Pending) end)
-                    end
-                end
-            else
-                -- Panel is up: only re-resolve the root occasionally (match
-                -- transitions) instead of every half second.
-                L._Recheck=(L._Recheck or 0)+1
-                if L._Recheck>=8 then
-                    L._Recheck=0
-                    local p=parent()
-                    if p and p~=L.LoginUI.Parent then destroy(L.LoginUI);L.LoginUI=nil end
+                local d=UI.Build("login",L.Key,L.Status,L.Login)
+                if d then
+                    d.Busy=L.Pending;d.StatusText=L.Status;L.LoginUI=d
+                    pcall(function() d.Input:SetIsEnabled(not L.Pending);d.Button:SetIsEnabled(not L.Pending) end)
                 end
             end
             L.NeedsUpdate=true -- Half-second retry/readiness while locked only.
-        end
-        -- Starts the UI/authorization pump. Safe to call more than once.
-        L.Start=function()
-            if L._Started then return true end
-            L._Started=true
-            L._Beat=os.clock()
-            local function step()
-                L._Beat=os.clock()
-                pcall(function() if L.Update then L.Update() end end)
-                pcall(function() if _G.__run_pending_features then _G.__run_pending_features() end end)
-            end
-            local function getTicker()
-                local t
-                pcall(function() t=require("common.time_ticker") end)
-                return t
-            end
-            local function startLoop()
-                local t=getTicker()
-                if t and type(t.AddTimerLoop)=="function" then
-                    pcall(t.AddTimerLoop,0.5,step,-1,0.5)
-                    return true
-                end
-                if Game and type(Game.SetTimer)=="function" then
-                    pcall(function() Game:SetTimer(0.5,true,step) end)
-                    return true
-                end
-                return false
-            end
-            local function watchdog()
-                if os.clock()-L._Beat>1.5 then startLoop() end
-                local t=getTicker()
-                if t and type(t.AddTimerOnce)=="function" then
-                    pcall(t.AddTimerOnce,1.5,watchdog)
-                elseif Game and type(Game.SetTimer)=="function" then
-                    pcall(function() Game:SetTimer(1.5,false,watchdog) end)
-                end
-            end
-            startLoop()
-            local t=getTicker()
-            if t and type(t.AddTimerOnce)=="function" then
-                pcall(t.AddTimerOnce,1.5,watchdog)
-            elseif Game and type(Game.SetTimer)=="function" then
-                pcall(function() Game:SetTimer(1.5,false,watchdog) end)
-            end
-            -- Independent game-timer watchdog: survives match transitions even
-            -- when the shared ticker is reset by another module.
-            if Game and type(Game.SetTimer)=="function" then
-                pcall(function()
-                    Game:SetTimer(2.0,true,function()
-                        if os.clock()-L._Beat>2.5 then startLoop() end
-                    end)
-                end)
-            end
-            step()
-            return true
         end
     end
     _G.MasterLicenseLogin=function(key) return _G.LunarLoginRuntime.Login(key) end
@@ -18313,153 +18344,6 @@ end
 
 print("[VIP STANDALONE V6] Loaded — Multi-Match Persistent + Native UMG Name/HP/Dist + Full-Body Chams")
 
-
-]===])
-
--- ============================================================================
--- 3. 3.lua
--- ============================================================================
-__defer_feature('3.lua', [===[
--- 165 FPS Unlock (FPS only)
-
-local KismetMathLibrary_1 = import("KismetMathLibrary")
-
-local logic_setting_graphics_1 = package.loaded["client.slua.logic.setting.logic_setting_graphics"] or require("client.slua.logic.setting.logic_setting_graphics")
-local GSC_FPS_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPS"] or require("client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPS")
-local GSC_FPSFT_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPSFT"] or require("client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPSFT")
-local GraphicSettingDB_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.GraphicSettingDB"] or require("client.slua.umg.NewSetting.GraphicsNew.GraphicSettingDB")
-
-if logic_setting_graphics_1 then
-    local var_132 = logic_setting_graphics_1.SetFPS
-    function logic_setting_graphics_1.SetFPS(gameInstance, FPSLevel)
-        if FPSLevel == 8 and GraphicSettingDB_1 then
-            local var_234 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
-            if not var_234 then
-                GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneSwitch, true)
-            end
-        end
-        if var_132 then
-            var_132(gameInstance, FPSLevel)
-        end
-        if FPSLevel == 8 and GraphicSettingDB_1 then
-            GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneNum, 165)
-            gameInstance:ExecuteCMD("t.MaxFPS", "165")
-            gameInstance:ExecuteCMD("r.FrameRateLimit", "165")
-        end
-    end
-end
-
-if GSC_FPS_1 and GSC_FPS_1.__inner_impl then
-    local var_160 = GSC_FPS_1.__inner_impl
-    function var_160:GetMaxFPSLevel() return 8, 8 end
-    function var_160:CanChangeQualityAndFPSPreCheck() return true end
-    function var_160:InitRealSupportFPS()
-        local var_29 = {}
-        for i = 1, 8 do var_29[i] = {true, true} end
-        if GraphicSettingDB_1 then GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.RealSupportFPS, var_29, false) end
-        return var_29
-    end
-    function var_160:SetFPSAndQualityEnable(bEnable)
-        if self.UIRoot and self.UIRoot.Image_Mask then self:SetWidgetVisible(self.UIRoot.Image_Mask, false) end
-    end
-    function var_160:UpdateSelectedFPSState(selectedLevel)
-        local var_37 = { [2]="NodeFps20", [3]="NodeFps25", [4]="NodeFps30", [5]="NodeFps40", [6]="NodeFps60", [7]="NodeFps90", [8]="NodeFps120" }
-        if not self.UIRoot then return end
-        for level, name in pairs(var_37) do
-            if self.UIRoot[name] then
-                self:WidgetSelfHit(self.UIRoot[name])
-                self.UIRoot[name]:SetIsEnabled(true)
-                local var_54 = self.UIRoot["WidgetSwitcher_" .. level]
-                if var_54 then var_54:SetActiveWidgetIndex(level == selectedLevel and 0 or 1) end
-            end
-        end
-    end
-    local var_58 = var_160.UpdateUI
-    function var_160:UpdateUI()
-        if var_58 then pcall(var_58, self) end
-        self:SelfHitTestInvisible()
-        self:InitRealSupportFPS()
-        self:SetFPSAndQualityEnable(true)
-        local var_222 = 8
-        if GraphicSettingDB_1 then
-            if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.CustomTab) == 2 then
-                var_222 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.LobbyFPS) or 8
-            else
-                var_222 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.SelectedFPS) or 8
-            end
-        end
-        self:UpdateSelectedFPSState(var_222)
-    end
-    function var_160:DoClickFPS(FPSLevel)
-        if slua.isValid(self.UIRoot) then
-            if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.CustomTab) == 2 then
-                GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.LobbyFPS, FPSLevel)
-            else
-                GraphicSettingDB_1:UpdateSelectedFPS(FPSLevel)
-            end
-            self:UpdateSelectedFPSState(FPSLevel)
-            if self:GetParentUI() then
-                self:GetParentUI():SaveQualityAndFPS()
-                self:GetParentUI():SetDirty(true)
-            end
-        end
-    end
-end
-
-if GSC_FPSFT_1 and GSC_FPSFT_1.__inner_impl then
-    local var_13 = GSC_FPSFT_1.__inner_impl
-    local var_93, var_203 = 90, 5
-    local function func_6(val, min, max) return val < min and min or (val > max and max or val) end
-    function var_13:ShowOrHide()
-        self:SelfHitTestInvisible()
-        if self.InitFPSFTSwitch then self:InitFPSFTSwitch() end
-    end
-    function var_13:InitFPSFTSwitch()
-        local sw = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
-        if self.UIRoot.Setting_Switch then self.UIRoot.Setting_Switch:SetSwitcherEnable2(sw, true) end
-        if self.UIRoot.CanvasPanel_8 then self:SetWidgetVisible(self.UIRoot.CanvasPanel_8, sw) end
-        if self.UIRoot.WidgetSwitcher_0 then self.UIRoot.WidgetSwitcher_0:SetActiveWidgetIndex(2) end
-        if self.InitFPSFTValue165 then self:InitFPSFTValue165() end
-    end
-    function var_13:InitFPSFTValue165()
-        local var_202 = self.UIRoot
-        local sw = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
-        local var_69 = sw and GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum) or 165
-        var_202.Slider_screen3:SetLocked(not sw)
-        var_202.ProgressBar_screen3:SetFillColorAndOpacity(sw and FLinearColor(1,1,1,1) or FLinearColor(1,0.625,0.6,1))
-        local var_60 = (var_69 - var_93) / (165 - var_93)
-        var_202.Veihclescreen3:SetText(LocUtil.LocalizeResFormat(10567, var_69))
-        var_202.Slider_screen3:SetValue(var_60)
-        var_202.ProgressBar_screen3:SetPercent(var_60)
-    end
-    function var_13:OnFPSFTValueChange3(var_69)
-        GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneNum, var_69)
-        self:InitFPSFTValue165()
-        if self:GetParentUI() then self:GetParentUI():SetDirty(true) end
-        local var_43 = GraphicSettingDB_1.GetGameInstance and GraphicSettingDB_1.GetGameInstance()
-        if var_43 then
-            var_43:ExecuteCMD("t.MaxFPS", tostring(var_69))
-            var_43:ExecuteCMD("r.FrameRateLimit", tostring(var_69))
-        end
-    end
-    function var_13:OnFPSFTSliderValueChange3(var_174)
-        if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch) then
-            local var_69 = KismetMathLibrary_1.FCeil(var_174 * (165 - var_93) / var_203) * var_203 + var_93
-            self:OnFPSFTValueChange3(func_6(var_69, var_93, 165))
-        end
-    end
-    function var_13:OnFPSFTAdd3()
-        local var_69 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum)
-        if var_69 then self:OnFPSFTValueChange3(math.min(165, var_69 + var_203)) end
-    end
-    function var_13:OnFPSFTMinus3()
-        local var_69 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum)
-        if var_69 then self:OnFPSFTValueChange3(math.max(var_93, var_69 - var_203)) end
-    end
-    var_13.OnFPSFTAdd = var_13.OnFPSFTAdd3
-    var_13.OnFPSFTMinus = var_13.OnFPSFTMinus3
-    var_13.OnFPSFTSliderValueChange = var_13.OnFPSFTSliderValueChange3
-end
 
 ]===])
 
