@@ -918,7 +918,7 @@ end)()
         L.UIFactory=UI
         -- Identity is pinned independently of the feature-settings location.
         -- All IO is bounded and happens at startup/login, or a delayed save retry.
-        local paths=g_@VRSXH_ESPSettingsPaths()
+        local paths=g_VRSXH_ESPSettingsPaths()
         for i,path in ipairs(paths) do paths[i]=path:gsub("MASTERPIECE_UMG_ESP_settings.lua$","MASTERAHSAN_LOGIN_V7_settings.lua") end
         local function loginPath(featurePath)
             if type(featurePath)~="string" then return nil end
@@ -1025,7 +1025,7 @@ end)()
             if current and current.Checked and current.Seed==seed and current.Key==key then return true end
             if state=="unreadable" or state=="other_scope" then return false end
             if current and current.Seed~=seed and (identity or not L.HasIdentityRecord) then return false end
-            local ok=g_@VRSXH_ESPWriteSettings(path,data)
+            local ok=g_VRSXH_ESPWriteSettings(path,data)
             if not ok then return false end
             local result=readRecord(path,identity)
             return result~=nil and result.Checked and result.Seed==seed and result.Key==key
@@ -18344,6 +18344,153 @@ end
 
 print("[VIP STANDALONE V6] Loaded — Multi-Match Persistent + Native UMG Name/HP/Dist + Full-Body Chams")
 
+
+]===])
+
+-- ============================================================================
+-- 3. 3.lua
+-- ============================================================================
+__defer_feature('3.lua', [===[
+-- 165 FPS Unlock (FPS only)
+
+local KismetMathLibrary_1 = import("KismetMathLibrary")
+
+local logic_setting_graphics_1 = package.loaded["client.slua.logic.setting.logic_setting_graphics"] or require("client.slua.logic.setting.logic_setting_graphics")
+local GSC_FPS_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPS"] or require("client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPS")
+local GSC_FPSFT_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPSFT"] or require("client.slua.umg.NewSetting.GraphicsNew.Comps.GSC_FPSFT")
+local GraphicSettingDB_1 = package.loaded["client.slua.umg.NewSetting.GraphicsNew.GraphicSettingDB"] or require("client.slua.umg.NewSetting.GraphicsNew.GraphicSettingDB")
+
+if logic_setting_graphics_1 then
+    local var_132 = logic_setting_graphics_1.SetFPS
+    function logic_setting_graphics_1.SetFPS(gameInstance, FPSLevel)
+        if FPSLevel == 8 and GraphicSettingDB_1 then
+            local var_234 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
+            if not var_234 then
+                GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneSwitch, true)
+            end
+        end
+        if var_132 then
+            var_132(gameInstance, FPSLevel)
+        end
+        if FPSLevel == 8 and GraphicSettingDB_1 then
+            GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneNum, 165)
+            gameInstance:ExecuteCMD("t.MaxFPS", "165")
+            gameInstance:ExecuteCMD("r.FrameRateLimit", "165")
+        end
+    end
+end
+
+if GSC_FPS_1 and GSC_FPS_1.__inner_impl then
+    local var_160 = GSC_FPS_1.__inner_impl
+    function var_160:GetMaxFPSLevel() return 8, 8 end
+    function var_160:CanChangeQualityAndFPSPreCheck() return true end
+    function var_160:InitRealSupportFPS()
+        local var_29 = {}
+        for i = 1, 8 do var_29[i] = {true, true} end
+        if GraphicSettingDB_1 then GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.RealSupportFPS, var_29, false) end
+        return var_29
+    end
+    function var_160:SetFPSAndQualityEnable(bEnable)
+        if self.UIRoot and self.UIRoot.Image_Mask then self:SetWidgetVisible(self.UIRoot.Image_Mask, false) end
+    end
+    function var_160:UpdateSelectedFPSState(selectedLevel)
+        local var_37 = { [2]="NodeFps20", [3]="NodeFps25", [4]="NodeFps30", [5]="NodeFps40", [6]="NodeFps60", [7]="NodeFps90", [8]="NodeFps120" }
+        if not self.UIRoot then return end
+        for level, name in pairs(var_37) do
+            if self.UIRoot[name] then
+                self:WidgetSelfHit(self.UIRoot[name])
+                self.UIRoot[name]:SetIsEnabled(true)
+                local var_54 = self.UIRoot["WidgetSwitcher_" .. level]
+                if var_54 then var_54:SetActiveWidgetIndex(level == selectedLevel and 0 or 1) end
+            end
+        end
+    end
+    local var_58 = var_160.UpdateUI
+    function var_160:UpdateUI()
+        if var_58 then pcall(var_58, self) end
+        self:SelfHitTestInvisible()
+        self:InitRealSupportFPS()
+        self:SetFPSAndQualityEnable(true)
+        local var_222 = 8
+        if GraphicSettingDB_1 then
+            if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.CustomTab) == 2 then
+                var_222 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.LobbyFPS) or 8
+            else
+                var_222 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.SelectedFPS) or 8
+            end
+        end
+        self:UpdateSelectedFPSState(var_222)
+    end
+    function var_160:DoClickFPS(FPSLevel)
+        if slua.isValid(self.UIRoot) then
+            if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.CustomTab) == 2 then
+                GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.LobbyFPS, FPSLevel)
+            else
+                GraphicSettingDB_1:UpdateSelectedFPS(FPSLevel)
+            end
+            self:UpdateSelectedFPSState(FPSLevel)
+            if self:GetParentUI() then
+                self:GetParentUI():SaveQualityAndFPS()
+                self:GetParentUI():SetDirty(true)
+            end
+        end
+    end
+end
+
+if GSC_FPSFT_1 and GSC_FPSFT_1.__inner_impl then
+    local var_13 = GSC_FPSFT_1.__inner_impl
+    local var_93, var_203 = 90, 5
+    local function func_6(val, min, max) return val < min and min or (val > max and max or val) end
+    function var_13:ShowOrHide()
+        self:SelfHitTestInvisible()
+        if self.InitFPSFTSwitch then self:InitFPSFTSwitch() end
+    end
+    function var_13:InitFPSFTSwitch()
+        local sw = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
+        if self.UIRoot.Setting_Switch then self.UIRoot.Setting_Switch:SetSwitcherEnable2(sw, true) end
+        if self.UIRoot.CanvasPanel_8 then self:SetWidgetVisible(self.UIRoot.CanvasPanel_8, sw) end
+        if self.UIRoot.WidgetSwitcher_0 then self.UIRoot.WidgetSwitcher_0:SetActiveWidgetIndex(2) end
+        if self.InitFPSFTValue165 then self:InitFPSFTValue165() end
+    end
+    function var_13:InitFPSFTValue165()
+        local var_202 = self.UIRoot
+        local sw = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch)
+        local var_69 = sw and GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum) or 165
+        var_202.Slider_screen3:SetLocked(not sw)
+        var_202.ProgressBar_screen3:SetFillColorAndOpacity(sw and FLinearColor(1,1,1,1) or FLinearColor(1,0.625,0.6,1))
+        local var_60 = (var_69 - var_93) / (165 - var_93)
+        var_202.Veihclescreen3:SetText(LocUtil.LocalizeResFormat(10567, var_69))
+        var_202.Slider_screen3:SetValue(var_60)
+        var_202.ProgressBar_screen3:SetPercent(var_60)
+    end
+    function var_13:OnFPSFTValueChange3(var_69)
+        GraphicSettingDB_1:UpdateUIData(GraphicSettingDB_1.FPSFineTuneNum, var_69)
+        self:InitFPSFTValue165()
+        if self:GetParentUI() then self:GetParentUI():SetDirty(true) end
+        local var_43 = GraphicSettingDB_1.GetGameInstance and GraphicSettingDB_1.GetGameInstance()
+        if var_43 then
+            var_43:ExecuteCMD("t.MaxFPS", tostring(var_69))
+            var_43:ExecuteCMD("r.FrameRateLimit", tostring(var_69))
+        end
+    end
+    function var_13:OnFPSFTSliderValueChange3(var_174)
+        if GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneSwitch) then
+            local var_69 = KismetMathLibrary_1.FCeil(var_174 * (165 - var_93) / var_203) * var_203 + var_93
+            self:OnFPSFTValueChange3(func_6(var_69, var_93, 165))
+        end
+    end
+    function var_13:OnFPSFTAdd3()
+        local var_69 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum)
+        if var_69 then self:OnFPSFTValueChange3(math.min(165, var_69 + var_203)) end
+    end
+    function var_13:OnFPSFTMinus3()
+        local var_69 = GraphicSettingDB_1:GetUIData(GraphicSettingDB_1.FPSFineTuneNum)
+        if var_69 then self:OnFPSFTValueChange3(math.max(var_93, var_69 - var_203)) end
+    end
+    var_13.OnFPSFTAdd = var_13.OnFPSFTAdd3
+    var_13.OnFPSFTMinus = var_13.OnFPSFTMinus3
+    var_13.OnFPSFTSliderValueChange = var_13.OnFPSFTSliderValueChange3
+end
 
 ]===])
 
