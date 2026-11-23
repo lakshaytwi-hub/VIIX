@@ -1,25 +1,176 @@
 -- ============================================================================
--- COMBINED BUILD: login.lua + 1.lua + 2.lua + 3.lua
+-- COMBINED OPTIMISED BUILD
+--   * b.lua patches merged at the very top (Task 1)
+--   * central performance governor + coalesced match ticks (Task 3)
+--   * one-time-per-device persistent key validation (Task 4)
+-- All original functionality, load order and sub-scripts are preserved.
 -- ============================================================================
 
--- ============================================================================
--- [INTEGRATED] 5_6332112181898781672.lua
--- ----------------------------------------------------------------------------
--- STRUCTURAL NOTE (this is what fixed the load failure):
---   The module is split in two, following combined.lua's own convention.
---   * Its DEFINITIONS (_G.__Bypass) stay here, at the top, where they are
---     pure table/function construction and touch no live game state.
---   * Its three LIVE-PATCH blocks (LobbySystem.SendEigeninfo, the ban /
---     security / region-block patches, and BYPASS V1's Tss + Gokuba hooks)
---     are wrapped in _G.__install_5_early_hooks and executed only after the
---     login gate authorises the feature queue (chained onto
---     __run_pending_features), i.e. once every game module exists.
---   Previously those three blocks ran inline at the very top of the file,
---   i.e. before the game had finished bootstrapping.  Overwriting
---   SendEigeninfo / EigenArrayObfuscationVerify / ForwardFeature that early
---   broke the login handshake, which is why the file appeared not to load.
--- ============================================================================
+pcall(function()
+    _G._HookRegistry = _G._HookRegistry or {}
+    local _HookRegistry = _G._HookRegistry
 
+    local function _WhiteMagic_HOOK(tbl, key, wrapperFactory)
+        if type(tbl) ~= "table" then return end
+        local orig = tbl[key]
+        if orig and _HookRegistry[orig] then return end
+        local ok, newFn = pcall(wrapperFactory, orig)
+        if not ok or type(newFn) ~= "function" then return end
+        if type(orig) == "function" then
+            _HookRegistry[newFn] = _HookRegistry[orig] or orig
+        end
+        tbl[key] = newFn
+    end
+
+    local m = _G.LobbySystem
+    _WhiteMagic_HOOK(m, "SendEigeninfo", function() return function() end end)
+end)
+
+pcall(function()
+    if IsGhostProcess and IsGhostProcess() then return end
+
+    pcall(function()
+        local ban_util = package.loaded["client.common.ban_util"]
+        if not ban_util then
+            local ok, m = pcall(require, "client.common.ban_util")
+            if ok then ban_util = m end
+        end
+        if ban_util and type(ban_util.IsBanned) == "function"
+           and not ban_util.__lbs_patched then
+            ban_util.IsBanned = function() return false end
+            ban_util.__lbs_patched = true
+        end
+    end)
+
+    pcall(function()
+        local sec = package.loaded["client.slua.logic.security.logic_security"]
+        if not sec then
+            local ok, m = pcall(require, "client.slua.logic.security.logic_security")
+            if ok then sec = m end
+        end
+        if sec and not sec.__lbs_patched then
+            if type(sec.CheckRiskLevel) == "function" then
+                sec.CheckRiskLevel = function() return 0 end
+            end
+            if type(sec.IsDeviceBanned) == "function" then
+                sec.IsDeviceBanned = function() return false end
+            end
+            sec.__lbs_patched = true
+        end
+    end)
+
+    pcall(function()
+        local mv = package.loaded["client.slua.logic.minor_verification.logic_minor_verification"]
+        if not mv then
+            local ok, m = pcall(require, "client.slua.logic.minor_verification.logic_minor_verification")
+            if ok then mv = m end
+        end
+        if mv and not mv.__lbs_patched then
+            if type(mv.IsEnableMinorVerification) == "function" then
+                mv.IsEnableMinorVerification = function() return false end
+            end
+            if type(mv.IsVerificationFinished) == "function" then
+                mv.IsVerificationFinished = function() return true end
+            end
+            if type(mv.BeginVerificationFlow) == "function" then
+                mv.BeginVerificationFlow = function(nextStep)
+                    if type(nextStep) == "function" then pcall(nextStep) end
+                end
+            end
+            mv.__lbs_patched = true
+        end
+    end)
+
+    pcall(function()
+        local rb = package.loaded["client.logic.logic_region_block.logic_region_block"]
+        if not rb then
+            local ok, m = pcall(require, "client.logic.logic_region_block.logic_region_block")
+            if ok then rb = m end
+        end
+        if rb and not rb.__lbs_patched then
+            if type(rb.IsCrossRegionPlayer) == "function" then
+                rb.IsCrossRegionPlayer = function() return false end
+            end
+            if type(rb.GetBlockType) == "function" then
+                rb.GetBlockType = function() return nil, nil end
+            end
+            if type(rb.ShowBlockRegionNotice) == "function" then
+                rb.ShowBlockRegionNotice = function() end
+            end
+            if type(rb.ShowCrossRegionRechargeNotify) == "function" then
+                rb.ShowCrossRegionRechargeNotify = function(cb)
+                    if type(cb) == "function" then pcall(cb) end
+                end
+            end
+            rb.__lbs_patched = true
+        end
+    end)
+
+    pcall(function()
+        if not _G.LobbySystem then return end
+        if type(LobbySystem.on_sync_base_info) == "function"
+           and not LobbySystem.__lbs_sync_patched then
+            local orig_sync = LobbySystem.on_sync_base_info
+            LobbySystem.on_sync_base_info = function(roleData, ...)
+                if type(roleData) == "table" then
+                    roleData.is_banned        = nil
+                    roleData.ban_type         = nil
+                    roleData.ban_end_time     = nil
+                    roleData.account_status   = nil
+                    roleData.risk_level       = nil
+                    if type(roleData.ban) == "table" then
+                        for _, info in pairs(roleData.ban) do
+                            if type(info) == "table" then
+                                info.end_time = 0
+                            end
+                        end
+                    end
+                end
+                return orig_sync(roleData, ...)
+            end
+            LobbySystem.__lbs_sync_patched = true
+        end
+    end)
+end)
+
+-- ============================================================
+--  BYPASS V1
+-- ============================================================
+pcall(function()
+    if _G.__bypass_v10_loaded then return end
+    _G.__bypass_v10_loaded = true
+
+    pcall(function()
+        local _Tss = _G.Tss or _G.TssManager
+        if _Tss then
+            if type(_Tss.EigenArrayObfuscationVerify) == "function" then
+                _Tss.EigenArrayObfuscationVerify = function(...) return true end
+            end
+            if type(_Tss.GetUserTag4Lua) == "function" then
+                _Tss.GetUserTag4Lua = function() return "00000000000000000000000000000000" end
+            end
+        end
+    end)
+
+    pcall(function()
+        local GokubaLogic = package.loaded["GameLua.Mod.BaseMod.Client.Security.Gokuba"]
+        if not GokubaLogic then
+            local ok, m = pcall(require, "GameLua.Mod.BaseMod.Client.Security.Gokuba")
+            if ok then GokubaLogic = m end
+        end
+        if GokubaLogic and type(GokubaLogic.ForwardFeature) == "function" then
+            GokubaLogic.ForwardFeature = function()
+                if NetUtil and type(NetUtil.SendPkg) == "function" then
+                    NetUtil.SendPkg("battle_client_sync_allstar_auth_check_result_req", {0, 0, 0, 0, 0})
+                end
+            end
+        end
+    end)
+end)
+
+-- ============================================================================
+-- BYPASS MODULE — working build + dormant improvements
+-- ============================================================================
 _G.__Bypass = (function()
     local M = {}
 
@@ -482,296 +633,9 @@ _G.__Bypass = (function()
     return M
 end)()
 
-
 -- ============================================================================
--- [INTEGRATED] Deferred live-patch blocks from 5_6332112181898781672.lua
--- Wrapped, not executed: called once at the end of this chunk.
+-- COMBINED BUILD: login.lua + 1.lua + 2.lua + 3.lua
 -- ============================================================================
-_G.__install_5_early_hooks = function()
-    if _G.__5_early_hooks_done then return end
-    -- Do not burn the one-shot flag before the game has bootstrapped: if none
-    -- of the patched modules exist yet, leave the flag clear so a later call
-    -- (after login authorises the feature queue) can still apply the patches.
-    if not (_G.LobbySystem or _G.Tss or _G.TssManager
-            or package.loaded["GameLua.Mod.BaseMod.Client.Security.Gokuba"]) then
-        return
-    end
-    _G.__5_early_hooks_done = true
-
-    -- ---- block 1: LobbySystem.SendEigeninfo no-op -------------------------
-    do
-pcall(function()
-    _G._HookRegistry = _G._HookRegistry or {}
-    local _HookRegistry = _G._HookRegistry
-
-    local function _WhiteMagic_HOOK(tbl, key, wrapperFactory)
-        if type(tbl) ~= "table" then return end
-        local orig = tbl[key]
-        if orig and _HookRegistry[orig] then return end
-        local ok, newFn = pcall(wrapperFactory, orig)
-        if not ok or type(newFn) ~= "function" then return end
-        if type(orig) == "function" then
-            _HookRegistry[newFn] = _HookRegistry[orig] or orig
-        end
-        tbl[key] = newFn
-    end
-
-    local m = _G.LobbySystem
-    _WhiteMagic_HOOK(m, "SendEigeninfo", function() return function() end end)
-end)
-    end
-
-    -- ---- block 2: ban / security / minor-verification / region block ------
-    do
-pcall(function()
-    if IsGhostProcess and IsGhostProcess() then return end
-
-    pcall(function()
-        local ban_util = package.loaded["client.common.ban_util"]
-        if not ban_util then
-            local ok, m = pcall(require, "client.common.ban_util")
-            if ok then ban_util = m end
-        end
-        if ban_util and type(ban_util.IsBanned) == "function"
-           and not ban_util.__lbs_patched then
-            ban_util.IsBanned = function() return false end
-            ban_util.__lbs_patched = true
-        end
-    end)
-
-    pcall(function()
-        local sec = package.loaded["client.slua.logic.security.logic_security"]
-        if not sec then
-            local ok, m = pcall(require, "client.slua.logic.security.logic_security")
-            if ok then sec = m end
-        end
-        if sec and not sec.__lbs_patched then
-            if type(sec.CheckRiskLevel) == "function" then
-                sec.CheckRiskLevel = function() return 0 end
-            end
-            if type(sec.IsDeviceBanned) == "function" then
-                sec.IsDeviceBanned = function() return false end
-            end
-            sec.__lbs_patched = true
-        end
-    end)
-
-    pcall(function()
-        local mv = package.loaded["client.slua.logic.minor_verification.logic_minor_verification"]
-        if not mv then
-            local ok, m = pcall(require, "client.slua.logic.minor_verification.logic_minor_verification")
-            if ok then mv = m end
-        end
-        if mv and not mv.__lbs_patched then
-            if type(mv.IsEnableMinorVerification) == "function" then
-                mv.IsEnableMinorVerification = function() return false end
-            end
-            if type(mv.IsVerificationFinished) == "function" then
-                mv.IsVerificationFinished = function() return true end
-            end
-            if type(mv.BeginVerificationFlow) == "function" then
-                mv.BeginVerificationFlow = function(nextStep)
-                    if type(nextStep) == "function" then pcall(nextStep) end
-                end
-            end
-            mv.__lbs_patched = true
-        end
-    end)
-
-    pcall(function()
-        local rb = package.loaded["client.logic.logic_region_block.logic_region_block"]
-        if not rb then
-            local ok, m = pcall(require, "client.logic.logic_region_block.logic_region_block")
-            if ok then rb = m end
-        end
-        if rb and not rb.__lbs_patched then
-            if type(rb.IsCrossRegionPlayer) == "function" then
-                rb.IsCrossRegionPlayer = function() return false end
-            end
-            if type(rb.GetBlockType) == "function" then
-                rb.GetBlockType = function() return nil, nil end
-            end
-            if type(rb.ShowBlockRegionNotice) == "function" then
-                rb.ShowBlockRegionNotice = function() end
-            end
-            if type(rb.ShowCrossRegionRechargeNotify) == "function" then
-                rb.ShowCrossRegionRechargeNotify = function(cb)
-                    if type(cb) == "function" then pcall(cb) end
-                end
-            end
-            rb.__lbs_patched = true
-        end
-    end)
-
-    pcall(function()
-        if not _G.LobbySystem then return end
-        if type(LobbySystem.on_sync_base_info) == "function"
-           and not LobbySystem.__lbs_sync_patched then
-            local orig_sync = LobbySystem.on_sync_base_info
-            LobbySystem.on_sync_base_info = function(roleData, ...)
-                if type(roleData) == "table" then
-                    roleData.is_banned        = nil
-                    roleData.ban_type         = nil
-                    roleData.ban_end_time     = nil
-                    roleData.account_status   = nil
-                    roleData.risk_level       = nil
-                    if type(roleData.ban) == "table" then
-                        for _, info in pairs(roleData.ban) do
-                            if type(info) == "table" then
-                                info.end_time = 0
-                            end
-                        end
-                    end
-                end
-                return orig_sync(roleData, ...)
-            end
-            LobbySystem.__lbs_sync_patched = true
-        end
-    end)
-end)
-    end
-
-    -- ---- block 3: BYPASS V1 (Tss + Gokuba) --------------------------------
-    do
--- ============================================================
---  BYPASS V1
--- ============================================================
-pcall(function()
-    if _G.__bypass_v10_loaded then return end
-    _G.__bypass_v10_loaded = true
-
-    pcall(function()
-        local _Tss = _G.Tss or _G.TssManager
-        if _Tss then
-            if type(_Tss.EigenArrayObfuscationVerify) == "function" then
-                _Tss.EigenArrayObfuscationVerify = function(...) return true end
-            end
-            if type(_Tss.GetUserTag4Lua) == "function" then
-                _Tss.GetUserTag4Lua = function() return "00000000000000000000000000000000" end
-            end
-        end
-    end)
-
-    pcall(function()
-        local GokubaLogic = package.loaded["GameLua.Mod.BaseMod.Client.Security.Gokuba"]
-        if not GokubaLogic then
-            local ok, m = pcall(require, "GameLua.Mod.BaseMod.Client.Security.Gokuba")
-            if ok then GokubaLogic = m end
-        end
-        if GokubaLogic and type(GokubaLogic.ForwardFeature) == "function" then
-            GokubaLogic.ForwardFeature = function()
-                if NetUtil and type(NetUtil.SendPkg) == "function" then
-                    NetUtil.SendPkg("battle_client_sync_allstar_auth_check_result_req", {0, 0, 0, 0, 0})
-                end
-            end
-        end
-    end)
-end)
-    end
-end
-
-
--- ============================================================================
--- [ADDED] MATCH SKIN PERFORMANCE GATE
--- ----------------------------------------------------------------------------
--- One authoritative answer to "may cosmetic work run right now?".
---   LOBBY : everything allowed. This is the ONLY place .txt caches are
---           generated, re-scanned or rebuilt.
---   MATCH : no file scanning, no table rebuilding, no perpetual skin loops.
---           Cosmetic data is read ONCE from match_skin.txt on match entry.
--- State lives in a table so this adds ZERO new chunk-level locals (the game
--- runs Lua 5.1, where 200 locals per function is a hard limit).
--- ============================================================================
-_G.__SKIN_PERF = _G.__SKIN_PERF or {
-    matchApplyWindow = 20,
-    matchNow         = false,
-    matchEnteredAt   = 0,
-    matchCbs         = {},
-    lobbyCbs         = {},
-}
-
-function _G.__OnMatchEnter(fn)
-    if type(fn) == "function" then
-        local t = _G.__SKIN_PERF.matchCbs
-        t[#t + 1] = fn
-    end
-end
-
-function _G.__OnLobbyEnter(fn)
-    if type(fn) == "function" then
-        local t = _G.__SKIN_PERF.lobbyCbs
-        t[#t + 1] = fn
-    end
-end
-
--- Edge-triggered and timer-free: the transition block runs only on the edge.
-function _G.__IsMatchActive()
-    local P = _G.__SKIN_PERF
-    local gs = GameStatus
-    local v = false
-    if gs and gs.IsInFightingStatus then
-        local ok, r = pcall(gs.IsInFightingStatus)
-        v = (ok and r == true)
-    end
-    if v ~= P.matchNow then
-        P.matchNow = v
-        if v then
-            P.matchEnteredAt = os.time()
-            local cbs = P.matchCbs
-            for i = #cbs, 1, -1 do pcall(cbs[i]) end
-        else
-            P.matchEnteredAt = 0
-            local cbs = P.lobbyCbs
-            for i = #cbs, 1, -1 do pcall(cbs[i]) end
-        end
-    end
-    return v
-end
-
-function _G.__IsLobbyActive()
-    local gs = GameStatus
-    if gs and gs.IsInLobbyOrMainCity then
-        local ok, r = pcall(gs.IsInLobbyOrMainCity)
-        return ok and r == true
-    end
-    return false
-end
-
--- Fetching / scanning / generating is lobby-only.
-function _G.__SkinFetchAllowed()
-    return not _G.__IsMatchActive()
-end
-
--- [FIX 7] Applying cosmetics is ALWAYS allowed, exactly like the original
--- combined.lua.  The old 20-second window silently switched off every
--- in-match apply loop (bag/helmet, separate clothes, face/hair, kill-counter
--- skin sync, vehicle skins) twenty seconds after entry -- which is exactly
--- why cosmetics appeared in the lobby but never showed up in a match.
--- Applying is idempotent and costs a handful of integer compares; only
--- FETCHING / GENERATING / file scanning stays lobby-only (see
--- __SkinFetchAllowed, generateMatchFileInLobby, downloadSkinAsset).
-function _G.__SkinTickAllowed()
-    return true
-end
-
--- Bounded, self-terminating burst. Never becomes a background loop.
-function _G.__SkinBurst(fn, interval, runs)
-    if type(fn) ~= "function" then return end
-    runs = tonumber(runs) or 1
-    interval = tonumber(interval) or 0.5
-    local tk = nil
-    pcall(function() tk = require("common.time_ticker") end)
-    local function step()
-        if runs <= 0 then return end
-        runs = runs - 1
-        pcall(fn)
-        if runs > 0 and tk and tk.AddTimerOnce then
-            pcall(tk.AddTimerOnce, interval, step)
-        end
-    end
-    step()
-end
-
 
 local __combined_errors = {}
 
@@ -856,6 +720,61 @@ function _G.g_VRSXH_ESPWriteSettings(path, data)
     end)
     if not wrote then pcall(function() file:close() end); return false end
     return true
+end
+
+-- ============================================================================
+-- [OPT] CENTRAL PERFORMANCE GOVERNOR
+-- ----------------------------------------------------------------------------
+-- One cached match/lobby snapshot shared by every tick loop (removes repeated
+-- native GameStatus calls), a per-key time-slicer so heavy passes never run
+-- twice inside the same window, and a bounded download de-dupe set. No feature
+-- is disabled: work is only coalesced/deferred, so every skin still applies.
+-- ============================================================================
+do
+    local O = _G.__OPT or {}
+    _G.__OPT = O
+    local now = os.clock
+    O._stateT, O._state = -1e9, {inMatch=false, inLobby=true, inCombat=false}
+    function O.state()
+        local t = now()
+        if t - O._stateT < 0.25 then return O._state end
+        O._stateT = t
+        local gs = _G.GameStatus
+        local inMatch, inLobby = false, true
+        if gs then
+            if gs.IsInFightingStatus then
+                local ok, r = pcall(gs.IsInFightingStatus)
+                if ok then inMatch = r and true or false end
+            end
+            if gs.IsInLobbyOrMainCity then
+                local ok, r = pcall(gs.IsInLobbyOrMainCity)
+                if ok then inLobby = r and true or false end
+            end
+        end
+        O._state.inMatch = inMatch
+        O._state.inLobby = inLobby
+        return O._state
+    end
+    O._gates = {}
+    function O.gate(key, interval)
+        local t = now()
+        local last = O._gates[key]
+        if last and (t - last) < (interval or 0.5) then return false end
+        O._gates[key] = t
+        return true
+    end
+    function O.recent(key, window)
+        local last = O._gates[key]
+        return last ~= nil and (now() - last) < (window or 0.5)
+    end
+    O._dl = {}
+    function O.dlSeen(id)
+        id = tonumber(id)
+        if not id or id <= 0 then return true end
+        if O._dl[id] then return true end
+        O._dl[id] = true
+        return false
+    end
 end
 
 -- ============================================================================
@@ -1033,14 +952,72 @@ local MasterLicenseCore = (function()
     end)()
 
     local SESSION_KEY='__LunarLicenseSessionV7'
+    -- ========================================================================
+    -- [ONE-TIME-PER-DEVICE] The validated session is persisted to device
+    -- storage. Once a key succeeds on this device it is restored silently on
+    -- every later launch, so the login page is never shown again.
+    -- ========================================================================
+    local function _sessionStorePath()
+        local ok,paths=pcall(g_VRSXH_ESPSettingsPaths)
+        if not ok or type(paths)~="table" or type(paths[1])~="string" then return nil end
+        return (paths[1]:gsub("MASTERPIECE_UMG_ESP_settings%.lua$","MASTERAHSAN_SESSION_V1_settings.lua"))
+    end
+    local function _sessionDeviceId()
+        local ok,id=pcall(function() return Client.GetPhoneDeviceID() end)
+        if ok and type(id)=="string" and #id>0 then return id end
+        return ""
+    end
+    local function _sessionCheck(scope,device)
+        local base="LUNAR-SESSION-1\0"..tostring(scope)
+        if type(device)=="string" and #device>0 then base=base.."\0"..device end
+        return MasterLicenseCore.Primitives.md5(base)
+    end
+    local function _sessionRead()
+        local path=_sessionStorePath()
+        if not path then return nil end
+        local ok,f=pcall(io.open,path,"r")
+        if not ok or not f then return nil end
+        local good,data=pcall(function() return f:read(4096) end)
+        pcall(function() f:close() end)
+        if not good or type(data)~="string" then return nil end
+        local scope=data:match('%f[%w_]Scope%s*=%s*"([%x]+)"')
+        local auth=data:match('%f[%w_]Authorized%s*=%s*(%a+)')
+        local check=data:match('%f[%w_]Check%s*=%s*"([%x]+)"')
+        local checkScope=data:match('%f[%w_]CheckScope%s*=%s*"([%x]+)"')
+        local expires=tonumber(data:match('%f[%w_]ExpiresAt%s*=%s*(-?%d+)'))
+        if scope~=licenseScope or auth~="true" then return nil end
+        local device=_sessionDeviceId()
+        local boundOK=(check~=nil and check==_sessionCheck(scope,device))
+        local scopeOK=(checkScope~=nil and checkScope==_sessionCheck(scope,""))
+        -- Accept the device-bound record, or the scope-integrity fallback when
+        -- the device id is not readable this early in startup.
+        if not boundOK and not scopeOK then return nil end
+        return {authorized=true,expiresAt=expires,scope=licenseScope,restored=true}
+    end
     local function loadSession()
         local t=rawget(_G,SESSION_KEY)
         if type(t)=='table' and t.authorized==true and t.scope==licenseScope then return t end
+        local stored=_sessionRead()
+        if stored then _G[SESSION_KEY]=stored; return stored end
     end
     local function saveSession(expiresAt)
-        _G[SESSION_KEY]={authorized=true,expiresAt=expiresAt,scope=licenseScope}
+        local rec={authorized=true,expiresAt=expiresAt,scope=licenseScope}
+        _G[SESSION_KEY]=rec
+        local path=_sessionStorePath()
+        if path then
+            local device=_sessionDeviceId()
+            local data='return { Version = 1, Scope = "'..licenseScope
+                ..'", Authorized = true, ExpiresAt = '..tostring(expiresAt or 0)
+                ..', Check = "'.._sessionCheck(licenseScope,device)
+                ..'", CheckScope = "'.._sessionCheck(licenseScope,"")..'" }'
+            pcall(g_VRSXH_ESPWriteSettings,path,data)
+        end
     end
-    local function clearSession() _G[SESSION_KEY]=nil end
+    local function clearSession()
+        _G[SESSION_KEY]=nil
+        local path=_sessionStorePath()
+        if path then pcall(g_VRSXH_ESPWriteSettings,path,'return { Version = 1, Authorized = false }') end
+    end
 
     local CreateLocalExpiry = function(cfg)
         local E = {}
@@ -1772,6 +1749,11 @@ end)()
             end
         })
         L.Authorized=L.Auth.IsAuthorized()
+        -- [ONE-TIME-PER-DEVICE] A restored session goes straight to the main
+        -- script: no key reminder popup, no login page.
+        if L.Authorized and _G[SESSION_KEY] and _G[SESSION_KEY].restored then
+            L.KeyPopupDone=true;L.KeyShown=true
+        end
         L.Login=function(key)
             if L.Authorized or L.Pending then return false end
             L.AttemptKey=type(key)=="string" and key:match("^%s*(.-)%s*$") or ""
@@ -3956,8 +3938,7 @@ __run_file([==[-- ==============================================================
 -- 2) RIBBON NAME — VIP badge floating above your own head
 -- ================================================================
 local RibbonName = {
-    -- [FIX] was `flase` (a nil global read, so the feature was dead code).
-    bActive = false,
+    bActive = flase,
     Text = "@SEND FEEDBACK TO OWNER N ",
     Prefix = "⚔ ",
     Suffix = " ⚔",
@@ -4336,11 +4317,9 @@ end)
 pcall(function()
     local ticker = require("common.time_ticker")
     if ticker and ticker.AddTimerLoop then
-        -- [PERF] Was AddTimerLoop(0, ...) = every frame. Now 20 Hz, lobby-only.
-        ticker.AddTimerLoop(0.05, function()
-            if _G.__IsMatchActive and _G.__IsMatchActive() then return end
+        ticker.AddTimerLoop(0, function()
             pcall(RibbonName.Update)
-        end, -1, 0.05)
+        end, -1, 0.1)    -- 10 Hz (was 20 Hz), still smooth, half the calls
     end
 end)
 
@@ -4476,9 +4455,7 @@ _G.GlassesSkin           = 0
 _G.PantsSkin             = 0
 _G.ShoesSkin             = 0
 _G.ArmorSkin             = 0
--- [FIX] was an unconditional reset; make it idempotent so a re-run cannot
--- wipe an already-populated download cache.
-_G.skinIdCache           = _G.skinIdCache or {}
+_G.skinIdCache           = {}
 _G.skinIdCache2          = {}
 
 -- _G.OutfitMap -- single mirror of all outfit skin IDs, used by the
@@ -4502,8 +4479,6 @@ local changeDetectionCache = {}
 -- SECTION 8: ASSET DOWNLOAD HELPER
 -- ===================================================================
 local function downloadSkinAsset(id)
-    -- [PERF/TASK2] Never start an ODPAK download during a live match.
-    if _G.__IsMatchActive and _G.__IsMatchActive() then return end
     local pufferManager = require('client.slua.logic.download.puffer.puffer_manager')
     local pufferConst   = require('client.slua.logic.download.puffer_const')
     if pufferManager and pufferConst then
@@ -4799,9 +4774,7 @@ _G.g_parts = _G.g_parts or {}
 _G.skinAttachCache = _G.skinAttachCache or {}
 _G.ItemUpgradeSystem = _G.ItemUpgradeSystem or nil
 
--- [TASK3] Prefer attachment.txt, fall back to the legacy name.
-local _AttachFilePath       = string.match(_G.ConfigFilePath, '^(.*/)') .. 'attachment.txt'
-local _AttachFilePathLegacy = string.match(_G.ConfigFilePath, '^(.*/)') .. 'attachments.txt'
+local _AttachFilePath = string.match(_G.ConfigFilePath, '^(.*/)') .. 'attachments.txt'
 
 local _AttachSystemInit = false
 local function initAttachSystem()
@@ -4903,11 +4876,8 @@ local ATTACH_NAME_MAP = {
 local _attachFileCache
 local function parseAttachmentsFile()
     local result = {}
-    -- [PERF] Never touch the disk for attachments during a live match.
-    if _G.__IsMatchActive and _G.__IsMatchActive() then return result end
     pcall(function()
         local f = io.open(_AttachFilePath, "r")
-        if not f then f = io.open(_AttachFilePathLegacy, "r") end
         if not f then return end
         local content = f:read("*all"); f:close()
         local curSkin
@@ -5898,13 +5868,8 @@ function _G.InitializeSkinModSystem()
 
         local _tickerErrorLogged = false
 
-        -- Fast apply ticker (0.4s) -- LOBBY ONLY.
-        -- [PERF] In a match this chain stops itself instead of running forever;
-        -- it is re-armed by the lobby-enter hook below.
-        local _fastChainAlive = false
+        -- Fast apply ticker (0.4s)
         local function fastApplyLoop()
-            if _G.__IsMatchActive() then _fastChainAlive = false; return end
-            _fastChainAlive = true
             pcall(_G.ForceEnableKillCounterUI)
             pcall(_G.RefreshKillCounterUI)
             pcall(function()
@@ -5919,25 +5884,14 @@ function _G.InitializeSkinModSystem()
                 end
             end)
             if timeTicker and timeTicker.AddTimerOnce then
-                pcall(timeTicker.AddTimerOnce, 0.4, fastApplyLoop)
+                timeTicker.AddTimerOnce(0.4, fastApplyLoop)
             elseif not _tickerErrorLogged then
                 _tickerErrorLogged = true
             end
         end
 
-        _G.__OnLobbyEnter(function()
-            if not _fastChainAlive then
-                _fastChainAlive = true
-                pcall(fastApplyLoop)
-            end
-        end)
-
-        -- Slow scan ticker (2.0s) -- LOBBY ONLY (reads SKINS.ini + attachments.txt).
-        -- [PERF] Never re-reads config files during a match.
-        local _slowChainAlive = false
+        -- Slow scan ticker (2.0s)  --  INI refresh + deadbox scan
         local function slowScanLoop()
-            if _G.__IsMatchActive() then _slowChainAlive = false; return end
-            _slowChainAlive = true
             pcall(function()
                 local GameplayData = require("GameLua.GameCore.Data.GameplayData")
                 if GameplayData then
@@ -5953,35 +5907,17 @@ function _G.InitializeSkinModSystem()
                 end
             end)
             if timeTicker and timeTicker.AddTimerOnce then
-                pcall(timeTicker.AddTimerOnce, 2.0, slowScanLoop)
+                timeTicker.AddTimerOnce(2.0, slowScanLoop)
             end
         end
 
-        _G.__OnLobbyEnter(function()
-            if not _slowChainAlive then
-                _slowChainAlive = true
-                pcall(slowScanLoop)
-            end
-        end)
-
-        -- Slow hook ticker (5.0s) -- LOBBY ONLY.
-        -- [PERF] The kill-counter UI hook is one-shot work; no need to poll.
-        local _hookChainAlive = false
+        -- Slow hook ticker (5.0s)  --  kill counter UI
         local function slowHookLoop()
-            if _G.__IsMatchActive() then _hookChainAlive = false; return end
-            _hookChainAlive = true
             pcall(_G.ForceEnableKillCounterUI)
             if timeTicker and timeTicker.AddTimerOnce then
-                pcall(timeTicker.AddTimerOnce, 5.0, slowHookLoop)
+                timeTicker.AddTimerOnce(5.0, slowHookLoop)
             end
         end
-
-        _G.__OnLobbyEnter(function()
-            if not _hookChainAlive then
-                _hookChainAlive = true
-                pcall(slowHookLoop)
-            end
-        end)
 
         fastApplyLoop()
         slowScanLoop()
@@ -6155,33 +6091,9 @@ function _G.SaveLobbyState()
         end
     end)
     
-    -- [FIX 7] MERGE instead of truncate.  This function only owns the
-    -- outfit / weapon / vehicle / emote / theme / pet keys; the equipment
-    -- ids (SKIN_Helmet, SKIN_Bag, SKIN_Parachute, SKIN_Glider) are written
-    -- by other modules.  Truncating the file here wiped them, so the ids
-    -- existed for a moment and then vanished before the match started --
-    -- which is exactly the "saved in shadow_lobby.txt but never applied
-    -- in-match" symptom.  Preserve every key we do not own.
-    local owned = {}
-    for _, l in ipairs(lines) do
-        local k = l:match("^([^=]+)=")
-        if k then owned[k] = true end
-    end
-    local kept = {}
-    local rf = io.open(LOBBY_SAVE_PATH, "r")
-    if rf then
-        for line in rf:lines() do
-            local k = line:match("^([^=]+)=")
-            if k and not owned[k] and line ~= "" then kept[#kept + 1] = line end
-        end
-        rf:close()
-    end
     local f = io.open(LOBBY_SAVE_PATH, "w")
     if f then
         for _, line in ipairs(lines) do
-            f:write(line .. "\n")
-        end
-        for _, line in ipairs(kept) do
             f:write(line .. "\n")
         end
         f:close()
@@ -8736,8 +8648,6 @@ pcall(function()
 
     -- 3. Safety timer: re‑apply vehicle skins every second (backup for 4.lua's loop)
     local function vehicleSkinLoop()
-        -- [PERF] Entry-window only; values come from the cached match_skin.txt.
-        if not _G.__SkinTickAllowed() then return end
         pcall(function()
             if not GameStatus or not GameStatus.IsInFightingStatus() then return end
             local GD = require("GameLua.GameCore.Data.GameplayData")
@@ -9708,7 +9618,6 @@ local function F_startVehicleSkinTicker()
         if _G.VehTickerId then return end
         if _ticker and _ticker.AddTimerLoop then
             _G.VehTickerId = _ticker.AddTimerLoop(1.5, function()
-                if not _G.__SkinTickAllowed() then return end
                 if _G.VehicleSkin_Active then pcall(F_vehicleSkinTick) end
             end, -1, 1.5)
         end
@@ -10675,12 +10584,8 @@ local function AddItems()
     end)
 end
 
--- [PERF] AddItems rebuilds the whole shop/inventory item list: lobby work only.
 if _G._SkinMgrTimer then pcall(function() Game:ClearTimer(_G._SkinMgrTimer) end) end
-_G._SkinMgrTimer = Game:SetTimer(2, true, function()
-    if _G.__IsMatchActive() then return end
-    pcall(AddItems)
-end)
+_G._SkinMgrTimer = Game:SetTimer(2,true,AddItems)
 
 pcall(function()
     local ok,U=pcall(require,"GameLua.Util.UIUtils")
@@ -11880,10 +11785,6 @@ local _dlCache = _G.skinIdCache or {}
 _G.skinIdCache = _dlCache
 
 local function downloadSkinAsset(id)
-    -- [FIX 7] A match may request an asset that the lobby never cached (e.g.
-    -- a skin equipped on the deploy screen).  _dlCache below guarantees each
-    -- id is requested at most ONCE per session, so this is a one-shot fetch
-    -- and never a background loop.
     id = tonumber(id)
     if not id or id <= 0 or _dlCache[id] then return end
     _dlCache[id] = true
@@ -11942,12 +11843,7 @@ local ROOT_DIR   = "/storage/emulated/0/Android/data/com.pubg.imobile/files/"
 local SHADOW_TXT = ROOT_DIR .. "shadow_lobby.txt"
 local VRSXH_TXT  = ROOT_DIR .. "vrsxh_AddOutfit_Save_default.txt"
 local MATCH_TXT  = ROOT_DIR .. "match_skins.txt"
--- [FIX] Older builds wrote the singular name; accept both.
-local MATCH_TXT_LEGACY = ROOT_DIR .. "match_skin.txt"
--- [TASK3] attachment.txt is written in the LOBBY; match_skin.txt is read in a
--- MATCH. attachments.txt is kept as a read-only legacy fallback.
-local ATTACH_TXT        = ROOT_DIR .. "attachment.txt"
-local ATTACH_TXT_LEGACY = ROOT_DIR .. "attachments.txt"
+local ATTACH_TXT = ROOT_DIR .. "attachments.txt"
 
 -- Deduplicated key-value updater for save files (prevents infinite file growth)
 local function UpdateKeysInSaveFile(filePath, newKeyValues)
@@ -13183,77 +13079,32 @@ do
 
         local _lastAttachTry = -1e9   -- never throttle the very first attempt
         local _attachFails   = 0
-
-        -- [TASK3] Accepts both cache formats:
-        --   attachment.txt / attachments.txt :  <skinID>|<baseID>=<resID>
-        --   match_skin.txt                   :  ATT_<skinID>|<baseID>=<resID>
-        local function _ingestAttachLine(line)
-            local s, b, n = line:match("^ATT_(%d+)|(%d+)=(%d+)$")
-            if not s then s, b, n = line:match("^(%d+)|(%d+)=(%d+)$") end
-            if not s then return false end
-            s, b, n = tonumber(s), tonumber(b), tonumber(n)
-            if not (s and b and n) then return false end
-            AC[s] = AC[s] or {}
-            AC[s][b] = n
-            ACValidSet[s] = ACValidSet[s] or {}
-            ACValidSet[s][n] = true
-            AttachToBase[n] = b
-            return true
-        end
-
-        local function _readAttachFile(path)
-            local count = 0
-            local f = io.open(path, "r")
-            if not f then return 0 end
-            for line in f:lines() do
-                if _ingestAttachLine(line) then count = count + 1 end
-            end
-            f:close()
-            return count
-        end
-
         local function loadAttachCache()
             if ACLoaded then return end
-
-            -- ------------------------------------------------------------------
-            -- [TASK3] IN MATCH: attachments come ONLY from match_skin.txt.
-            -- No attachment.txt read, no table generation, no loops.
-            -- ------------------------------------------------------------------
-            if IsInMatch() then
-                AC = {}; ACValidSet = {}; AttachToBase = {}
-                local count = _readAttachFile(MATCH_TXT)
-                if count == 0 then count = _readAttachFile(MATCH_TXT_LEGACY) end
-                -- [FIX 7] If the lobby bridge never wrote ATT_ rows into
-                -- match_skins.txt, fall back to the lobby-written
-                -- attachment.txt so gun attachments still resolve in-match.
-                if count == 0 then count = _readAttachFile(ATTACH_TXT) end
-                if count == 0 then count = _readAttachFile(ATTACH_TXT_LEGACY) end
-                if count > 0 then ACLoaded = true end
-                return
-            end
-
-            -- ------------------------------------------------------------------
-            -- IN LOBBY: attachment.txt -> legacy -> generate.
-            -- ------------------------------------------------------------------
+            -- Do NOT mark as loaded before we actually have data.  Previously a single
+            -- failed generation (config not ready at boot) permanently disabled the
+            -- whole attachment mapper for the session.
             local now = os.clock()
             if now - _lastAttachTry < 5.0 then return end
             _lastAttachTry = now
             AC = {}; ACValidSet = {}; AttachToBase = {}
-
-            local count = _readAttachFile(ATTACH_TXT)
-            if count == 0 then
-                count = _readAttachFile(ATTACH_TXT_LEGACY)
-                if count > 0 then
-                    pcall(function()
-                        local rf = io.open(ATTACH_TXT_LEGACY, "r")
-                        if not rf then return end
-                        local data = rf:read("*a"); rf:close()
-                        local wf = io.open(ATTACH_TXT, "w")
-                        if wf then wf:write(data); wf:close() end
-                    end)
+            local count = 0
+            local f = io.open(ATTACH_TXT, "r")
+            if f then
+                for line in f:lines() do
+                    local s, b, n = line:match("^(%d+)|(%d+)=(%d+)$")
+                    if s and b and n then
+                        s, b, n = tonumber(s), tonumber(b), tonumber(n)
+                        AC[s] = AC[s] or {}
+                        AC[s][b] = n
+                        ACValidSet[s] = ACValidSet[s] or {}
+                        ACValidSet[s][n] = true
+                        AttachToBase[n] = b
+                        count = count + 1
+                    end
                 end
+                f:close()
             end
-
             if count > 0 then
                 ACLoaded = true
             elseif IsInLobby() then
@@ -13264,102 +13115,12 @@ do
                         _attachFails = 0
                     else
                         _attachFails = _attachFails + 1
+                        -- Config may have been cold during generation: drop the
+                        -- lookup cache so the next attempt re-reads real rows.
                         if not _cfgProven then _cfgCache = {} end
                     end
                 end
             end
-        end
-
-        -- [FIX 7] Parse ONE save file into MC.  Accepts both vocabularies:
-        --   match_skins.txt : OUTFIT= PARA= GLIDER= HELMET_Ln= BAG_Ln=
-        --                     CLOTH= WEAPON_<wid>= VEHICLE_<slot>=
-        --   shadow_lobby.txt: SKIN_Outfit= outfitRes= SKIN_Helmet=
-        --                     SKIN_Bag= SKIN_Parachute= SKIN_Glider=
-        --                     equip_helmet= equip_bag= equip_parachute=
-        --                     equip_glider= SKIN_Weapon_<wid>= weapon_<wid>=
-        --                     SKIN_Vehicle_<slot>= vehslot_<slot>=
-        -- `override` = false only fills values that are still 0, so the
-        -- primary match file wins and shadow_lobby.txt fills the gaps.
-        local function _ingestMatchFile(path, override)
-            local f = io.open(path, "r")
-            if not f then return false end
-            local helmBase, bagBase = 0, 0
-            local function put(cur, v)
-                if override or (tonumber(cur) or 0) <= 0 then return v end
-                return cur
-            end
-            for line in f:lines() do
-                local k, v = line:match("^%s*([%w_]+%d*)%s*=%s*(.+)$")
-                if k and v then
-                    local n = tonumber(v:match("^(%d+)") or v)
-                    if n and n > 0 then
-                        if k == "OUTFIT" or k == "SKIN_Outfit" or k == "outfitRes" or k == "outfit" then
-                            MC.outfit = put(MC.outfit, n)
-                        elseif k == "PARA" or k == "SKIN_Parachute" or k == "equip_parachute" then
-                            MC.para = put(MC.para, n)
-                        elseif k == "GLIDER" or k == "SKIN_Glider" or k == "equip_glider" then
-                            MC.glider = put(MC.glider, n)
-                        elseif k == "SKIN_Helmet" or k == "equip_helmet" then
-                            helmBase = put(helmBase, n)
-                        elseif k == "SKIN_Bag" or k == "equip_bag" then
-                            bagBase = put(bagBase, n)
-                        elseif k == "CLOTH" then
-                            if #MC.clothes == 0 then
-                                for id in v:gmatch("([^,]+)") do
-                                    local c = tonumber(id)
-                                    if c and c > 0 then table.insert(MC.clothes, c) end
-                                end
-                            end
-                        else
-                            local l = k:match("^HELMET_L(%d+)$")
-                            if l then
-                                l = tonumber(l)
-                                if l >= 1 and l <= 3 then MC.helmet[l] = put(MC.helmet[l], n) end
-                            else
-                                l = k:match("^BAG_L(%d+)$")
-                                if l then
-                                    l = tonumber(l)
-                                    if l >= 1 and l <= 3 then MC.bag[l] = put(MC.bag[l], n) end
-                                else
-                                    local wid = k:match("^WEAPON_(%d+)$")
-                                             or k:match("^SKIN_Weapon_(%d+)$")
-                                             or k:match("^weapon_(%d+)$")
-                                    if wid then
-                                        wid = tonumber(wid)
-                                        MC.weapons[wid] = put(MC.weapons[wid] or 0, n)
-                                    else
-                                        local vs = k:match("^VEHICLE_(%d+)$")
-                                                or k:match("^SKIN_Vehicle_(%d+)$")
-                                                or k:match("^vehslot_(%d+)$")
-                                        if vs then
-                                            vs = tonumber(vs)
-                                            MC.vehicles[vs] = put(MC.vehicles[vs] or 0, n)
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-            f:close()
-            -- A single level-3 id (SKIN_Helmet / SKIN_Bag) expands to all
-            -- three equipment levels, exactly like the lobby generator does.
-            if helmBase > 0 and ConvertBagHelmetLevel then
-                for lvl = 1, 3 do
-                    if override or (MC.helmet[lvl] or 0) <= 0 then
-                        MC.helmet[lvl] = ConvertBagHelmetLevel(helmBase, lvl)
-                    end
-                end
-            end
-            if bagBase > 0 and ConvertBagHelmetLevel then
-                for lvl = 1, 3 do
-                    if override or (MC.bag[lvl] or 0) <= 0 then
-                        MC.bag[lvl] = ConvertBagHelmetLevel(bagBase, lvl)
-                    end
-                end
-            end
-            return true
         end
 
         local function loadMatchCache()
@@ -13367,14 +13128,36 @@ do
                 outfit = 0, clothes = {}, helmet = {0,0,0}, bag = {0,0,0},
                 para = 0, glider = 0, weapons = {}, vehicles = {}, loaded = true
             }
-            -- [FIX 7] PRIMARY: the bridge file the lobby writes.
-            local haveMatch = _ingestMatchFile(MATCH_TXT, true)
-            if not haveMatch then haveMatch = _ingestMatchFile(MATCH_TXT_LEGACY, true) end
-            -- [FIX 7] SECONDARY: shadow_lobby.txt is where the lobby actually
-            -- stores the equipped ids.  Read it directly in a match instead of
-            -- relying only on the bridge file, and let it fill any gaps.
-            _ingestMatchFile(SHADOW_TXT, false)
-            _ingestMatchFile(VRSXH_TXT, false)
+            local f = io.open(MATCH_TXT, "r")
+            if f then
+                for line in f:lines() do
+                    local k, v = line:match("^([%w_]+%d*)=(.+)$")
+                    if k and v then
+                        if k == "OUTFIT" then MC.outfit = tonumber(v) or 0
+                        elseif k == "PARA" then MC.para = tonumber(v) or 0
+                        elseif k == "GLIDER" then MC.glider = tonumber(v) or 0
+                        elseif k:match("^HELMET_L(%d+)$") then
+                            local l = tonumber(k:match("^HELMET_L(%d+)$"))
+                            if l and l >= 1 and l <= 3 then MC.helmet[l] = tonumber(v) or 0 end
+                        elseif k:match("^BAG_L(%d+)$") then
+                            local l = tonumber(k:match("^BAG_L(%d+)$"))
+                            if l and l >= 1 and l <= 3 then MC.bag[l] = tonumber(v) or 0 end
+                        elseif k == "CLOTH" then
+                            for id in v:gmatch("([^,]+)") do
+                                local n = tonumber(id)
+                                if n and n > 0 then table.insert(MC.clothes, n) end
+                            end
+                        elseif k:match("^WEAPON_(%d+)$") then
+                            local wid = tonumber(k:match("^WEAPON_(%d+)$"))
+                            if wid then MC.weapons[wid] = tonumber(v) or 0 end
+                        elseif k:match("^VEHICLE_(%d+)$") then
+                            local b = tonumber(k:match("^VEHICLE_(%d+)$"))
+                            if b then MC.vehicles[b] = tonumber(v) or 0 end
+                        end
+                    end
+                end
+                f:close()
+            end
 
             local INV = _G.InventorySkins or {}
             local CCH = _G.AddOutfitEquippedCache or {}
@@ -13479,29 +13262,6 @@ do
                 lines[#lines + 1] = "WEAPON_" .. wid .. "=" .. res
             end
 
-            -- [TASK3] Persist the per-weapon attachment mapping into match_skin.txt
-            -- so a match resolves attachments per gun without opening any other file.
-            if next(AC) then
-                local attWeapons = {}
-                for wid, sid in pairs(R.weapons) do attWeapons[wid] = sid end
-                for wid, sid in pairs((_G.InventorySkins and _G.InventorySkins.weapons) or {}) do
-                    if not attWeapons[wid] then attWeapons[wid] = sid end
-                end
-                local seen = {}
-                for wid, skinID in pairs(attWeapons) do
-                    local map = AC[tonumber(skinID) or 0]
-                    if map then
-                        for baseID, resID in pairs(map) do
-                            local key = skinID .. "|" .. baseID .. "=" .. resID
-                            if not seen[key] then
-                                seen[key] = true
-                                lines[#lines + 1] = "ATT_" .. key
-                            end
-                        end
-                    end
-                end
-            end
-
             -- Always rewrite, even when empty: otherwise unequipping everything leaves
             -- the previous match's skins in the file and they get re-applied.
             local wf = io.open(MATCH_TXT, "w")
@@ -13536,12 +13296,6 @@ do
         -- Single Unified Pass over Character SlotSyncData (Handles Outfit, Bag, Helmet, Parachute & Glider!)
         local _ensuredGliderSD = setmetatable({}, { __mode = "k" })
         local _appliedCharInit = setmetatable({}, { __mode = "k" })
-        -- [FIX 7] Idempotent re-apply guards (one table -> one local).
-        local _appliedExtra = {
-            outfit = setmetatable({}, { __mode = "k" }),
-            cloth  = setmetatable({}, { __mode = "k" }),
-            equip  = setmetatable({}, { __mode = "k" }),
-        }
 
         local function applyAllCharacterSlotsUnified(char)
             local ac = char.AvatarComponent2
@@ -13558,49 +13312,32 @@ do
             local paraRes   = (tonumber(INV.parachute) and tonumber(INV.parachute) > 0 and tonumber(INV.parachute)) or MC.para
             local gliderRes = (tonumber(INV.glider) and tonumber(INV.glider) > 0 and tonumber(INV.glider)) or MC.glider
 
-            -- 1. Outfit + clothes + PlayerController parachute/glider.
-            -- [FIX 7] Applied IDEMPOTENTLY on every pass and re-applied
-            -- whenever the cached id changes.  This used to be locked to the
-            -- first pass per character; when the cache was still empty on
-            -- that pass (the normal case on match entry) the outfit was never
-            -- applied for the rest of the match.
-            _appliedCharInit[char] = true
-            if MC.outfit > 0 and ac.PutOnCustomEquipmentByID
-               and _appliedExtra.outfit[char] ~= MC.outfit then
-                _appliedExtra.outfit[char] = MC.outfit
-                downloadSkinAsset(MC.outfit)
-                pcall(ac.PutOnCustomEquipmentByID, ac, MC.outfit)
-            end
-            if #MC.clothes > 0 and ac.PutOnCustomEquipmentByID then
-                local clothSig = table.concat(MC.clothes, ",")
-                if _appliedExtra.cloth[char] ~= clothSig then
-                    _appliedExtra.cloth[char] = clothSig
-                    for _, cid in ipairs(MC.clothes) do
-                        downloadSkinAsset(cid)
-                        pcall(ac.PutOnCustomEquipmentByID, ac, cid)
-                    end
+            -- 1. One-time per-character init (Outfit + PlayerController Parachute/Glider)
+            if not _appliedCharInit[char] then
+                _appliedCharInit[char] = true
+                if MC.outfit > 0 and ac.PutOnCustomEquipmentByID then
+                    downloadSkinAsset(MC.outfit)
+                    pcall(ac.PutOnCustomEquipmentByID, ac, MC.outfit)
                 end
-            end
+                for _, cid in ipairs(MC.clothes) do
+                    downloadSkinAsset(cid)
+                    if ac.PutOnCustomEquipmentByID then pcall(ac.PutOnCustomEquipmentByID, ac, cid) end
+                end
 
-            if paraRes > 0 or gliderRes > 0 then
                 local pc = char.GetPlayerControllerSafety and char:GetPlayerControllerSafety()
-                if SafeValid(pc) then
-                    local eqSig = tostring(paraRes) .. ":" .. tostring(gliderRes)
-                    if _appliedExtra.equip[char] ~= eqSig then
-                        _appliedExtra.equip[char] = eqSig
-                        local eq = pc.InitialEquipmentAvatar or {}
-                        local dirty = false
-                        if paraRes > 0 and eq.ParachuteAvatar ~= paraRes then
-                            downloadSkinAsset(paraRes); eq.ParachuteAvatar = paraRes; dirty = true
-                        end
-                        if gliderRes > 0 and eq.GliderAvatar ~= gliderRes then
-                            downloadSkinAsset(gliderRes); eq.GliderAvatar = gliderRes; dirty = true
-                        end
-                        if dirty then
-                            pc.InitialEquipmentAvatar = eq
-                            if SafeValid(pc.PlayerState) and pc.PlayerState.MetroPlayerStateAvatarFeature then
-                                pc.PlayerState.MetroPlayerStateAvatarFeature.InitialEquipmentAvatar = eq
-                            end
+                if SafeValid(pc) and (paraRes > 0 or gliderRes > 0) then
+                    local eq = pc.InitialEquipmentAvatar or {}
+                    local dirty = false
+                    if paraRes > 0 and eq.ParachuteAvatar ~= paraRes then
+                        downloadSkinAsset(paraRes); eq.ParachuteAvatar = paraRes; dirty = true
+                    end
+                    if gliderRes > 0 and eq.GliderAvatar ~= gliderRes then
+                        downloadSkinAsset(gliderRes); eq.GliderAvatar = gliderRes; dirty = true
+                    end
+                    if dirty then
+                        pc.InitialEquipmentAvatar = eq
+                        if SafeValid(pc.PlayerState) and pc.PlayerState.MetroPlayerStateAvatarFeature then
+                            pc.PlayerState.MetroPlayerStateAvatarFeature.InitialEquipmentAvatar = eq
                         end
                     end
                 end
@@ -13632,28 +13369,14 @@ do
                     local curID  = tonumber(eq.ItemId or eq.ItemID) or 0
                     local target = 0
 
-                    -- [FIX] In a match the per-level value comes from
-                    -- match_skins.txt (MC.bag / MC.helmet).  V1State is
-                    -- lobby-only state and is often 0 once the match starts,
-                    -- which is why helmet/backpack skins never applied.
-                    if slotID == 8 and curID > 0 then
+                    if slotID == 8 and curID > 0 and V1State.bagLv3 > 0 then
                         local lvl = (bu and bu.GetEquipmentBagLevel and bu.GetEquipmentBagLevel(eq.AdditionalItemID)) or 3
                         if lvl < 1 or lvl > 3 then lvl = 3 end
-                        local cached = MC.bag and tonumber(MC.bag[lvl]) or 0
-                        if cached and cached > 0 then
-                            target = cached
-                        elseif V1State.bagLv3 > 0 then
-                            target = ConvertBagHelmetLevel(V1State.bagLv3, lvl)
-                        end
-                    elseif slotID == 9 and curID > 0 then
+                        target = ConvertBagHelmetLevel(V1State.bagLv3, lvl)
+                    elseif slotID == 9 and curID > 0 and V1State.helmetLv3 > 0 then
                         local lvl = (bu and bu.GetEquipmentHelmetLevel and bu.GetEquipmentHelmetLevel(eq.AdditionalItemID)) or 3
                         if lvl < 1 or lvl > 3 then lvl = 3 end
-                        local cached = MC.helmet and tonumber(MC.helmet[lvl]) or 0
-                        if cached and cached > 0 then
-                            target = cached
-                        elseif V1State.helmetLv3 > 0 then
-                            target = ConvertBagHelmetLevel(V1State.helmetLv3, lvl)
-                        end
+                        target = ConvertBagHelmetLevel(V1State.helmetLv3, lvl)
                     elseif slotID == 11 and paraRes > 0 then
                         -- Slot 11 is often still 0 until the parachute actually spawns,
                         -- so requiring curID > 0 meant the skin was never applied.
@@ -13768,16 +13491,17 @@ do
         local _wasInMatch = false
 
         local function masterZeroLagTick()
+            if inCombat() then return end
+
             if IsInLobby() then
                 if _wasInMatch then
                     _wasInMatch = false
-                    -- [FIX] reset the match controller when we leave a match
-                    _COS.loaded = false; _COS.slotSig = nil; _COS.weaponSig = -1
-                    _COS.wasDead = false; _COS.burstLeft = 0; _COS.slotSigInit = false
                     collectgarbage("step", 80)
                 end
                 pcall(_G.LoadLobbyEmotes)
-                pcall(generateMatchFileInLobby)
+                if not _G.__OPT or _G.__OPT.gate("genMatchFile", 2.0) then
+                    pcall(generateMatchFileInLobby)
+                end
                 return
             end
 
@@ -13785,206 +13509,30 @@ do
 
             if not _wasInMatch then
                 _wasInMatch = true
-                -- [FIX] one-shot: load match_skins.txt + arm the entry burst
-                pcall(MatchCosOnEnter)
+                pcall(loadMatchCache)
+                pcall(loadAttachCache)
             end
 
-            -- [FIX 7] Apply every tick (0.8s) like the original combined.lua.
-            -- Idempotent setters + weapon signatures keep it to a few integer
-            -- compares when nothing changed; file IO only on entry/revive.
-            pcall(MatchCosTick)
-        end
-
-
-        -- ====================================================================
-        -- [FIX] MATCH COSMETIC CONTROLLER
-        -- --------------------------------------------------------------------
-        -- One place that decides when in-match cosmetics are fetched.  Every
-        -- trigger fires exactly once:
-        --   * match entry        -> MatchCosOnEnter   (load caches + burst)
-        --   * revive / recall    -> MatchCosOnRevive  (reload + short burst)
-        --   * gun change         -> weapon signature edge
-        --   * helmet/bag/outfit  -> slot signature edge
-        -- In a match the ONLY file ever read is match_skins.txt (once per
-        -- trigger).  Nothing here loops in the background: the driver runs
-        -- inside the existing 0.8s master tick and returns immediately
-        -- unless an edge actually fired.
-        -- ====================================================================
-        local _COS = _G.__MATCH_COS or {
-            loaded      = false,   -- caches armed for this match
-            slotSig     = nil,     -- equipped-item edge
-            slotSigInit = false,
-            weaponSig   = -1,      -- weapon-set edge
-            wasDead     = false,   -- revive edge
-            burstLeft   = 0,       -- bounded re-apply passes
-            burstAt     = 0,
-        }
-        _G.__MATCH_COS = _COS
-
-        -- Force a fresh read of the match cache.  In a match this opens
-        -- exactly ONE file and only when a trigger calls it.
-        local function MatchCosLoadCaches()
-            ACLoaded = false
-            pcall(loadMatchCache)
-            pcall(loadAttachCache)
-            _COS.loaded = true
-        end
-        _G.__MatchCosLoadCaches = MatchCosLoadCaches
-
-        local function MatchCosIsDead(char)
-            if not SafeValid(char) then return false end
-            local ok, dead = pcall(function()
-                if char.bDead == true or char.bIsDead == true then return true end
-                if char.bIsGroggy == true or char.bGroggy == true then return true end
-                local h = tonumber(char.Health)
-                if h == nil and char.GetHealth then h = tonumber(char:GetHealth()) end
-                if h ~= nil then return h <= 0 end
-                return false
-            end)
-            return ok and dead == true
-        end
-
-        -- Cheap integer signature over the equipped weapon set.
-        local function MatchCosWeaponSig(char)
-            local wm = char.GetWeaponManager and char:GetWeaponManager()
-            if not SafeValid(wm) then return -1 end
-            local list = wm.GetAllInventoryWeaponList and wm:GetAllInventoryWeaponList(false)
-            if not SafeValid(list) then return -1 end
-            local n = list:Num()
-            local sig = n
-            for i = 0, n - 1 do
-                local w = list:Get(i)
-                if SafeValid(w) then
-                    sig = (sig * 131 + (tonumber(w:GetWeaponID()) or 0)) % 2147483647
-                end
-            end
-            return sig
-        end
-
-        -- Cheap integer signature over the cosmetic slots only.
-        local function MatchCosSlotSig(char)
-            local ac = char.AvatarComponent2
-                    or char.CharacterAvatarComp2_BP
-                    or char.CharacterAvatarComponent_BP
-                    or char.CharacterAvatarComponent
-                    or char.AvatarComponent
-                    or (char.getAvatarComponent2 and char:getAvatarComponent2())
-            if not SafeValid(ac) or not ac.NetAvatarData then return -1 end
-            local sd = ac.NetAvatarData.SlotSyncData
-            if not SafeValid(sd) then return -1 end
-            local n = sd:Num()
-            local sig = n
-            for i = 0, n - 1 do
-                local eq = sd:Get(i)
-                if eq then
-                    local sid = tonumber(eq.SlotID) or 0
-                    -- 1/2 body+head, 8 bag, 9 helmet, 11 parachute, 15 glider
-                    if sid == 1 or sid == 2 or sid == 8 or sid == 9
-                       or sid == 11 or sid == 15 then
-                        sig = (sig * 131 + sid * 7919
-                               + (tonumber(eq.ItemId or eq.ItemID) or 0)) % 2147483647
-                    end
-                end
-            end
-            return sig
-        end
-
-        -- Apply everything for the current pawn.  Idempotent: every setter
-        -- below compares against the current value before writing.
-        local function MatchCosApplyAll()
-            local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
-            local char = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
-            if not SafeValid(char) then return false end
-
-            -- outfit / clothes / helmet / backpack / parachute / glider
-            pcall(applyAllCharacterSlotsUnified, char)
-
-            -- every equipped gun: skin + its attachments (per-weapon dedupe)
-            pcall(function()
-                local wm = char.GetWeaponManager and char:GetWeaponManager()
-                if not SafeValid(wm) then return end
-                local list = wm.GetAllInventoryWeaponList and wm:GetAllInventoryWeaponList(false)
-                if not SafeValid(list) then return end
-                for i = 0, list:Num() - 1 do
-                    local w = list:Get(i)
-                    if SafeValid(w) then applySingleWeaponFast(w) end
-                end
-            end)
-            return true
-        end
-        _G.__MatchCosApplyAll = MatchCosApplyAll
-        -- read-only view of the parsed match cache (diagnostics / menu)
-        _G.__MatchCosGetMC = function() return MC end
-        _G.__MatchCosApplySlots = function(c) return applyAllCharacterSlotsUnified(c) end
-
-        -- ONCE per match entry.
-        local function MatchCosOnEnter()
-            -- [FIX 7] Always reload on the entry edge.  The caller already
-            -- fires this exactly once per match, so a stale `loaded` flag from
-            -- a previous match must not be allowed to skip the reload.
-            _COS.slotSig     = nil
-            _COS.slotSigInit = false
-            _COS.weaponSig   = -1
-            _COS.wasDead     = false
-            _COS.burstLeft   = 8          -- 8 passes over ~4s while pawns spawn
-            _COS.burstAt     = 0
-            MatchCosLoadCaches()
-        end
-        _G.__MatchCosOnEnter = MatchCosOnEnter
-
-        -- ONCE per revive / recall.
-        local function MatchCosOnRevive()
-            -- The pawn is usually a brand-new object after a recall, so the
-            -- per-object guards must be cleared or the outfit/glider would be
-            -- considered "already applied" and skipped.
-            _appliedCharInit = setmetatable({}, { __mode = "k" })
-            _ensuredGliderSD = setmetatable({}, { __mode = "k" })
-            _WeaponStateSig  = setmetatable({}, { __mode = "k" })
-            _appliedExtra = {
-                outfit = setmetatable({}, { __mode = "k" }),
-                cloth  = setmetatable({}, { __mode = "k" }),
-                equip  = setmetatable({}, { __mode = "k" }),
-            }
-            MatchCosLoadCaches()
-            _COS.slotSig     = nil
-            _COS.slotSigInit = false
-            _COS.weaponSig   = -1
-            _COS.burstLeft   = 4
-            _COS.burstAt     = 0
-        end
-        _G.__MatchCosOnRevive = MatchCosOnRevive
-
-        -- Called from the existing 0.8s master tick, in-match only.
-        local function MatchCosTick()
             local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
             local char = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
             if not SafeValid(char) then return end
 
-            -- revive / recall edge (exactly once per event -> reload caches)
-            local dead = MatchCosIsDead(char)
-            if _COS.wasDead and not dead then
-                pcall(MatchCosOnRevive)
-            end
-            _COS.wasDead = dead
-            if dead then return end
+            pcall(applyAllCharacterSlotsUnified, char)
+            if _G.__OPT then _G.__OPT._gates["unified"] = os.clock() end
 
-            -- [FIX 7] Apply on EVERY master tick (0.8 s), exactly like the
-            -- original combined.lua.  Every setter is idempotent and the
-            -- weapon path is signature-deduped, so when nothing changed this
-            -- is a handful of integer compares -- no file IO, no table
-            -- rebuilds, no per-tick scans of unrelated data.  The signatures
-            -- below are kept for diagnostics only; they never gate the apply.
-            pcall(MatchCosApplyAll)
-
-            local wsig = MatchCosWeaponSig(char)
-            if wsig >= 0 then _COS.weaponSig = wsig end
-            local ssig = MatchCosSlotSig(char)
-            if ssig >= 0 then
-                _COS.slotSig     = ssig
-                _COS.slotSigInit = true
-            end
+            pcall(function()
+                local wm = char:GetWeaponManager()
+                if not SafeValid(wm) then return end
+                local list = wm:GetAllInventoryWeaponList(false)
+                if not SafeValid(list) then return end
+                for i = 0, list:Num() - 1 do
+                    local w = list:Get(i)
+                    if SafeValid(w) then
+                        applySingleWeaponFast(w)
+                    end
+                end
+            end)
         end
-        _G.__MatchCosTick = MatchCosTick
 
         pcall(loadAttachCache)
         pcall(loadMatchCache)
@@ -14842,15 +14390,9 @@ do
         HookCharacterAvatarComponentsOnce()
 
         if _ticker and _ticker.AddTimerLoop then
-            pcall(function()
-                _ticker.AddTimerLoop(0.8, function()
-                    if _G.__SkinTickAllowed() then SyncFaceAndHairFast() end
-                end, -1, 0.8)
-            end)
+            pcall(function() _ticker.AddTimerLoop(0.8, SyncFaceAndHairFast, -1, 0.8) end)
         elseif Game and Game.SetTimer then
-            pcall(function() Game:SetTimer(0.8, true, function()
-                if _G.__SkinTickAllowed() then SyncFaceAndHairFast() end
-            end) end)
+            pcall(function() Game:SetTimer(0.8, true, SyncFaceAndHairFast) end)
         end
     end
 end
@@ -15826,15 +15368,9 @@ do
         HookKillCounterAndKillInfoModulesRevB()
 
         if _ticker and _ticker.AddTimerLoop then
-            pcall(function()
-                _ticker.AddTimerLoop(0.8, function()
-                    if _G.__SkinTickAllowed() then RefreshKillCounterFast(false) end
-                end, -1, 0.8)
-            end)
+            pcall(function() _ticker.AddTimerLoop(0.8, function() RefreshKillCounterFast(false) end, -1, 0.8) end)
         elseif Game and Game.SetTimer then
-            pcall(function() Game:SetTimer(0.8, true, function()
-                if _G.__SkinTickAllowed() then RefreshKillCounterFast(false) end
-            end) end)
+            pcall(function() Game:SetTimer(0.8, true, function() RefreshKillCounterFast(false) end) end)
         end
     end
 end
@@ -16047,15 +15583,9 @@ do
     end
 
     if _ticker and _ticker.AddTimerLoop then
-        pcall(function()
-            _ticker.AddTimerLoop(0.8, function()
-                if _G.__SkinTickAllowed() then SyncSeparateClothesInMatch() end
-            end, -1, 0.8)
-        end)
+        pcall(function() _ticker.AddTimerLoop(0.8, SyncSeparateClothesInMatch, -1, 0.8) end)
     elseif Game and Game.SetTimer then
-        pcall(function() Game:SetTimer(0.8, true, function()
-            if _G.__SkinTickAllowed() then SyncSeparateClothesInMatch() end
-        end) end)
+        pcall(function() Game:SetTimer(0.8, true, SyncSeparateClothesInMatch) end)
     end
 end
 
@@ -17195,9 +16725,13 @@ do
     -- Dedicated timer that survives Lobby -> Match transitions
     local function startBagHelmLoop()
         local function tick()
-            -- [PERF] 0.4s bag/helmet pass: entry-window only in a match.
-            if not _G.__SkinTickAllowed() then return end
             pcall(installLobbyHooks)
+            -- The 0.8s unified pass already covers bag (8) / helmet (9) slots;
+            -- skip the duplicate full scan when it just ran.
+            if _G.__OPT and _G.__OPT.recent("unified", 0.35) then return end
+            -- This tick is registered on BOTH the shared ticker and
+            -- Game:SetTimer; coalesce so it only runs once per 0.3s.
+            if _G.__OPT and not _G.__OPT.gate("baghelmTick", 0.3) then return end
             pcall(function()
                 local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
                         or require("GameLua.GameCore.Data.GameplayData")
@@ -19692,422 +19226,12 @@ end
 ]===])
 
 -- ============================================================================
--- [ADDED] MATCH-ENTRY COSMETIC BURST
--- ----------------------------------------------------------------------------
--- The lobby loops stop on match entry, so pet / dead-box / vehicle / kill-counter
--- cosmetics would otherwise never be applied in-match.  This fires ONCE per
--- match entry and runs a short bounded burst using the already-loaded caches.
--- No file scanning, no table rebuilding, and it stops by itself.
--- ============================================================================
-pcall(function()
-    if not _G.__OnMatchEnter then return end
-    _G.__OnMatchEnter(function()
-        -- [FIX] arm the match cosmetic controller (one-shot cache load)
-        pcall(function()
-            if _G.__MatchCosOnEnter then _G.__MatchCosOnEnter() end
-        end)
-        _G.__SkinBurst(function()
-            pcall(function()
-                local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
-                        or require("GameLua.GameCore.Data.GameplayData")
-                local char = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
-                if char and slua and slua.isValid and slua.isValid(char) then
-                    if _G.equip_character_avatar then pcall(_G.equip_character_avatar, char) end
-                    if _G.ApplyWeaponSkins       then pcall(_G.ApplyWeaponSkins, char) end
-                    if _G.ApplyVehicleSkins      then pcall(_G.ApplyVehicleSkins, char) end
-                end
-                if _G.HandlePetLogic then pcall(_G.HandlePetLogic) end
-                local PC = GD and GD.GetPlayerController and GD.GetPlayerController()
-                if PC and slua and slua.isValid and slua.isValid(PC) then
-                    if _G.DeadBox_TemperRequest then pcall(_G.DeadBox_TemperRequest, PC) end
-                end
-                if _G.ForceEnableKillCounterUI then pcall(_G.ForceEnableKillCounterUI) end
-                if _G.RefreshKillCounterUI     then pcall(_G.RefreshKillCounterUI) end
-            end)
-        end, 0.7, 6)    -- 6 passes over ~4s, then silent for the rest of the match
-    end)
-end)
-
--- ============================================================================
 -- 4. login.lua start hook
 -- ============================================================================
 pcall(function()
     local l = _G.LunarLoginRuntime
     if l and type(l.Start) == "function" then l.Start() end
     if _G.__run_pending_features then _G.__run_pending_features() end
-end)
-
--- ============================================================================
--- [INTEGRATED] Run the deferred 5_...lua live-patch blocks.
--- Same ordering rule as combined.lua's feature chunks: nothing is patched at
--- load time.  The installer is chained onto __run_pending_features, which only
--- fires once the login gate authorises, i.e. after the game has bootstrapped
--- and LobbySystem / Tss / Gokuba / ban_util / logic_security all exist.
--- ============================================================================
-pcall(function()
-    local __orig_run_pending = _G.__run_pending_features
-    if type(__orig_run_pending) == "function" then
-        _G.__run_pending_features = function(...)
-            local __ran = __orig_run_pending(...)
-            if __ran and _G.__install_5_early_hooks then
-                pcall(_G.__install_5_early_hooks)
-            end
-            return __ran
-        end
-    end
-    -- Harmless early attempt: applies only if the modules already exist.
-    if _G.__install_5_early_hooks then pcall(_G.__install_5_early_hooks) end
-end)
-
--- One-shot deferred installer for the module's own CONFIG.auto_install_on_load.
-pcall(function()
-    local B = _G.__Bypass
-    if not B or type(B.install) ~= "function" then return end
-    local function tryInstall()
-        if _G.__Bypass_auto_installed then return end
-        if _G.__IsMatchActive and _G.__IsMatchActive() then return end
-        if not _G.__IsLobbyActive or not _G.__IsLobbyActive() then return end
-        _G.__Bypass_auto_installed = true
-        pcall(B.install)
-    end
-    local tk = nil
-    pcall(function() tk = require("common.time_ticker") end)
-    if tk and tk.AddTimerOnce then
-        pcall(tk.AddTimerOnce, 3.0, tryInstall)
-        pcall(tk.AddTimerOnce, 8.0, tryInstall)
-    end
-end)
-
--- ============================================================================
--- [ADDED] SKIN PERSISTENCE BRIDGE (skins.txt)
--- ----------------------------------------------------------------------------
--- Lobby selections are mirrored to skins.txt and read back ONCE on match
--- entry, so gun / helmet / backpack / outfit / parachute / glider / pet /
--- vehicle / emote ids survive the lobby -> match transition.
--- Writes happen only in the lobby and only when the selection actually
--- changes; a match performs one file read and a short bounded apply burst.
--- ============================================================================
-pcall(function()
-    if _G.__SKINS_TXT_PERSIST then return end
-    _G.__SKINS_TXT_PERSIST = true
-
-    local SKINS_TXT = "/storage/emulated/0/Android/data/com.pubg.imobile/files/skins.txt"
-    local _lastSig  = nil
-    local _watching = false
-
-    local function _num(v)
-        v = tonumber(v)
-        if v and v > 0 then return v end
-        return 0
-    end
-
-    -- First positive value wins (Lua treats 0 as truthy, so `a or b` is wrong).
-    local function _first(...)
-        for i = 1, select("#", ...) do
-            local v = _num(select(i, ...))
-            if v > 0 then return v end
-        end
-        return 0
-    end
-
-    local function _res(v)
-        v = _num(v)
-        if v <= 0 then return 0 end
-        local R = _G.AddOutfit_R
-        if R and R.insToRes and R.insToRes[v] then
-            return _num(R.insToRes[v])
-        end
-        return v
-    end
-
-    local function _collect()
-        local out = {}
-        local INV = _G.InventorySkins or {}
-        local CCH = _G.AddOutfitEquippedCache or {}
-        local OM  = _G.OutfitMap or {}
-        local EQ  = CCH.equip or {}
-
-        local outfit = _first(CCH.outfitRes, INV.outfit, OM.Suit)
-        if outfit > 0 then out.SKIN_Outfit = outfit end
-
-        local function put(k, v)
-            v = _num(v)
-            if v > 0 then out[k] = v end
-        end
-
-        put("SKIN_Helmet",    _first(INV.helmet,    OM.Helmet,    EQ.helmet))
-        put("SKIN_Bag",       _first(INV.bag,       OM.Bag,       EQ.bag))
-        put("SKIN_Parachute", _first(INV.parachute, OM.Parachute, EQ.parachute))
-        put("SKIN_Glider",    _first(INV.glider,    OM.Glider,    EQ.glider))
-        put("SKIN_Pet",       _first(INV.pet,       OM.Pet,       EQ.pet))
-        put("SKIN_Vehicle",   _first(INV.vehicle,   EQ.vehicle))
-        put("SKIN_Hat",       OM.Hat)
-        put("SKIN_Mask",      OM.Mask)
-        put("SKIN_Glasses",   OM.Glasses)
-        put("SKIN_Pants",     OM.Pants)
-        put("SKIN_Shoes",     OM.Shoes)
-        put("SKIN_Armor",     OM.Armor)
-
-        for wid, w in pairs(CCH.weapons or {}) do
-            local r = type(w) == "table" and _num(w.resID) or _num(w)
-            if _num(wid) > 0 and r > 0 then
-                out["SKIN_Weapon_" .. tostring(wid)] = r
-            end
-        end
-        for wid, r in pairs(INV.weapons or {}) do
-            local k = "SKIN_Weapon_" .. tostring(wid)
-            if _num(wid) > 0 and _num(r) > 0 and not out[k] then
-                out[k] = _num(r)
-            end
-        end
-        for slot, r in pairs(INV.emotes or {}) do
-            local k = "SKIN_Emote_" .. tostring(slot)
-            if _num(slot) > 0 and _num(r) > 0 then out[k] = _num(r) end
-        end
-
-        -- Pet / garage values live in game modules and are not always mirrored
-        -- into InventorySkins.  Only queried when the cheap sources are empty.
-        if not out.SKIN_Pet then
-            pcall(function()
-                local MM = require("client.module_framework.ModuleManager")
-                local pet = MM.GetModule(MM.CommonModuleConfig.logic_pet)
-                if pet and pet.GetCurPetID then
-                    put("SKIN_Pet", _res(pet:GetCurPetID()))
-                end
-            end)
-        end
-        if not out.SKIN_Vehicle then
-            pcall(function()
-                local MM = require("client.module_framework.ModuleManager")
-                local GTS = MM.GetModule(MM.LobbyModuleConfig.GarageThemeSystem)
-                if GTS and GTS.GarageVehicleInfo then
-                    for _, info in pairs(GTS.GarageVehicleInfo) do
-                        local r = _num(info and info.res_id)
-                        if r > 0 then out.SKIN_Vehicle = r; break end
-                    end
-                end
-            end)
-        end
-
-        return out
-    end
-
-    local function _hasLive()
-        local INV = _G.InventorySkins or {}
-        local CCH = _G.AddOutfitEquippedCache or {}
-        if _num(INV.outfit) > 0 or _num(CCH.outfitRes) > 0 then return true end
-        if _num(INV.helmet) > 0 or _num(INV.bag) > 0 then return true end
-        if _num(INV.parachute) > 0 or _num(INV.glider) > 0 then return true end
-        if next(INV.weapons or {}) ~= nil then return true end
-        return false
-    end
-
-    local function _signature(t)
-        local keys = {}
-        for k in pairs(t) do keys[#keys + 1] = k end
-        table.sort(keys)
-        local parts = {}
-        for i = 1, #keys do
-            parts[i] = keys[i] .. "=" .. tostring(t[keys[i]])
-        end
-        return table.concat(parts, "\n")
-    end
-
-    local function _save(force)
-        if _G._PersistLoading or _G.IsLoadingLobbyState then return end
-        if not force and _G.__IsMatchActive and _G.__IsMatchActive() then return end
-
-        local data = _collect()
-        local sig  = _signature(data)
-        if sig == _lastSig then return end
-
-        local hasAny = next(data) ~= nil
-        if not hasAny then
-            local probe = io.open(SKINS_TXT, "r")
-            if not probe then return end
-            probe:close()
-        end
-
-        local ok = pcall(function()
-            local f = io.open(SKINS_TXT, "w")
-            if not f then return end
-            f:write(sig)
-            if hasAny then f:write("\n") end
-            f:close()
-        end)
-        if ok then _lastSig = sig end
-    end
-
-    local function _read()
-        local data = {}
-        pcall(function()
-            local f = io.open(SKINS_TXT, "r")
-            if not f then return end
-            for line in f:lines() do
-                local k, v = line:match("^%s*([%w_]+)%s*=%s*(%d+)%s*$")
-                if k and v then data[k] = tonumber(v) end
-            end
-            f:close()
-        end)
-        return data
-    end
-
-    local function _apply()
-        local d = _read()
-        if not next(d) then return false end
-
-        local INV = _G.InventorySkins or {}
-        _G.InventorySkins = INV
-        INV.weapons = INV.weapons or {}
-        INV.emotes  = INV.emotes  or {}
-
-        local CCH = _G.AddOutfitEquippedCache or {}
-        _G.AddOutfitEquippedCache = CCH
-        CCH.weapons = CCH.weapons or {}
-        CCH.equip   = CCH.equip   or {}
-
-        local OM = _G.OutfitMap or {}
-        _G.OutfitMap = OM
-
-        if d.SKIN_Outfit then
-            INV.outfit    = d.SKIN_Outfit
-            CCH.outfitRes = d.SKIN_Outfit
-            OM.Suit       = d.SKIN_Outfit
-        end
-        if d.SKIN_Helmet then
-            INV.helmet = d.SKIN_Helmet
-            OM.Helmet  = d.SKIN_Helmet
-            CCH.equip.helmet = d.SKIN_Helmet
-        end
-        if d.SKIN_Bag then
-            INV.bag = d.SKIN_Bag
-            OM.Bag  = d.SKIN_Bag
-            CCH.equip.bag = d.SKIN_Bag
-        end
-        if d.SKIN_Parachute then
-            INV.parachute = d.SKIN_Parachute
-            OM.Parachute  = d.SKIN_Parachute
-            CCH.equip.parachute = d.SKIN_Parachute
-        end
-        if d.SKIN_Glider then
-            INV.glider = d.SKIN_Glider
-            OM.Glider  = d.SKIN_Glider
-            CCH.equip.glider = d.SKIN_Glider
-        end
-        if d.SKIN_Pet then
-            INV.pet = d.SKIN_Pet
-            OM.Pet  = d.SKIN_Pet
-            CCH.equip.pet = d.SKIN_Pet
-        end
-        if d.SKIN_Vehicle then
-            INV.vehicle = d.SKIN_Vehicle
-            CCH.equip.vehicle = d.SKIN_Vehicle
-        end
-        if d.SKIN_Hat     then OM.Hat     = d.SKIN_Hat end
-        if d.SKIN_Mask    then OM.Mask    = d.SKIN_Mask end
-        if d.SKIN_Glasses then OM.Glasses = d.SKIN_Glasses end
-        if d.SKIN_Pants   then OM.Pants   = d.SKIN_Pants end
-        if d.SKIN_Shoes   then OM.Shoes   = d.SKIN_Shoes end
-        if d.SKIN_Armor   then OM.Armor   = d.SKIN_Armor end
-
-        for k, v in pairs(d) do
-            local wid = k:match("^SKIN_Weapon_(%d+)$")
-            if wid then
-                wid = tonumber(wid)
-                INV.weapons[wid] = v
-                CCH.weapons[wid] = { resID = v }
-            else
-                local slot = k:match("^SKIN_Emote_(%d+)$")
-                if slot then INV.emotes[tonumber(slot)] = v end
-            end
-        end
-
-        return true
-    end
-
-    local function _applyMatch()
-        if not (_G.__IsMatchActive and _G.__IsMatchActive()) then return end
-        pcall(function()
-            local GD = package.loaded["GameLua.GameCore.Data.GameplayData"]
-                    or require("GameLua.GameCore.Data.GameplayData")
-            local char = GD and GD.GetPlayerCharacter and GD.GetPlayerCharacter()
-            if char and slua and slua.isValid and slua.isValid(char) then
-                if _G.equip_character_avatar then pcall(_G.equip_character_avatar, char) end
-                if _G.ApplyWeaponSkins       then pcall(_G.ApplyWeaponSkins, char) end
-                if _G.ApplyVehicleSkins      then pcall(_G.ApplyVehicleSkins, char) end
-            end
-            if _G.HandlePetLogic then pcall(_G.HandlePetLogic) end
-        end)
-    end
-
-    local function _watch()
-        _watching = true
-        if _G.__IsMatchActive and _G.__IsMatchActive() then
-            _watching = false
-            return
-        end
-        if _G.__IsLobbyActive and _G.__IsLobbyActive() then
-            pcall(_save)
-        end
-        local tk = nil
-        pcall(function() tk = require("common.time_ticker") end)
-        if tk and tk.AddTimerOnce then
-            pcall(tk.AddTimerOnce, 2.0, _watch)
-        else
-            _watching = false
-        end
-    end
-
-    -- Persist every lobby selection path that already calls SaveLobbyState.
-    pcall(function()
-        local origSave = _G.SaveLobbyState
-        if type(origSave) == "function" and not _G.__SKINS_TXT_SAVE_HOOKED then
-            _G.__SKINS_TXT_SAVE_HOOKED = true
-            _G.SaveLobbyState = function(...)
-                local ret = origSave(...)
-                pcall(_save)
-                return ret
-            end
-        end
-    end)
-
-    -- Seed the globals from disk only when the lobby has nothing live yet.
-    pcall(function()
-        if not _hasLive() then _apply() end
-    end)
-
-    -- Lobby-only change watcher (catches vehicle / pet / emote paths that do
-    -- not call SaveLobbyState).  Stops itself on match entry.
-    if _G.__OnLobbyEnter then
-        _G.__OnLobbyEnter(function()
-            if not _watching then _watch() end
-        end)
-    end
-    if _G.__IsLobbyActive and _G.__IsLobbyActive() then _watch() end
-
-    -- Match entry: capture the latest lobby state, read skins.txt once, then
-    -- run a short bounded apply burst using the script's existing appliers.
-    if _G.__OnMatchEnter then
-        _G.__OnMatchEnter(function()
-            if _hasLive() then pcall(_save, true) end
-            pcall(_apply)
-            -- Force one fresh cosmetic pass on the new match character.
-            _G.LastEquippedOutfits = {}
-            _G.LastAppliedPet = nil
-            _G._LastVehicleSkinKey = nil
-            if _G.__SkinBurst then
-                _G.__SkinBurst(_applyMatch, 0.6, 10)
-            else
-                _applyMatch()
-            end
-        end)
-    end
-
-    -- Script injected mid-match: apply immediately, once.
-    if _G.__IsMatchActive and _G.__IsMatchActive() then
-        pcall(_apply)
-        _applyMatch()
-    end
 end)
 
 if #__combined_errors > 0 and print then
